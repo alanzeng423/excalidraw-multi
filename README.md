@@ -4,7 +4,7 @@ Multi-board [Excalidraw](https://excalidraw.com/) hosted on Cloudflare Workers (
 
 - **Multiple boards in IndexedDB** — each board is stored independently in the browser with cross-tab sync (`BroadcastChannel`) and single-writer tab locking (`navigator.locks`).
 - **Excalidraw-style minimalist UI** — dot-grid canvas, floating island toolbar, transparent SVG board previews, and light/dark mode.
-- **LXGW WenKai Screen (霞鹜文楷)** — replaces Excalidraw's default `Xiaolai` CJK fallback with 97 unicode-range `.woff2` subsets, loaded on demand for canvas rendering and PNG/SVG export.
+- **Custom Canvas Fonts** — replaces Excalidraw's default `Xiaolai` CJK fallback with **LXGW WenKai Screen (霞鹜文楷)** (97 unicode-range `.woff2` subsets), and adds 5 self-hosted English fonts (**Shantell Sans**, **Google Sans**, **Open Sans**, **Playwrite AR Guides**, **Bentham**) directly to Excalidraw's font picker with LXGW WenKai CJK fallback.
 - **WebDAV Sync (Jianguoyun-ready)** — built-in Cloudflare Worker CORS proxy (`/api/webdav`) with SSRF protection, storing standard `.excalidraw` files and an `index.json` manifest (with deletion tombstones) for two-way sync across devices.
 
 ## Development & Deployment
