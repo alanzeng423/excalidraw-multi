@@ -16,7 +16,6 @@ import {
   stripAppState,
 } from "./storage";
 import {
-  JIANGUOYUN_URL,
   getLastSyncAt,
   getWebDAVConfig,
   saveWebDAVConfig,
@@ -140,7 +139,7 @@ function BoardPreview({ boardId, updatedAt, dark }) {
 function WebDAVModal({ config, onClose, onSavedAndSync }) {
   const [form, setForm] = useState(() => ({
     ...config,
-    url: config.url || JIANGUOYUN_URL,
+    url: config.url || "",
     folder: config.folder || "excalidraw",
   }));
   const [showPwd, setShowPwd] = useState(false);
@@ -199,8 +198,6 @@ function WebDAVModal({ config, onClose, onSavedAndSync }) {
     onClose();
   };
 
-  const isJianguoyun = (form.url || "").includes("jianguoyun.com");
-
   return (
     <div
       className="modal-backdrop"
@@ -216,7 +213,7 @@ function WebDAVModal({ config, onClose, onSavedAndSync }) {
           <div>
             <h3>WebDAV Sync</h3>
             <p className="modal-sub">
-              Sync standard <code>.excalidraw</code> files across devices
+              Sync <code>.excalidraw</code> boards &amp; library across devices
             </p>
           </div>
           <button
@@ -239,26 +236,13 @@ function WebDAVModal({ config, onClose, onSavedAndSync }) {
           </button>
         </div>
 
-        <div className="preset-row">
-          <button
-            type="button"
-            className={`preset-chip ${isJianguoyun ? "active" : ""}`}
-            onClick={() => update("url", JIANGUOYUN_URL)}
-          >
-            Jianguoyun (坚果云)
-          </button>
-          <span className="preset-hint">
-            Use account email + App Password (安全选项 → 第三方应用管理)
-          </span>
-        </div>
-
         <div className="field-grid">
           <label className="field">
             <span>Server URL</span>
             <input
               type="url"
               required
-              placeholder="https://dav.jianguoyun.com/dav/"
+              placeholder="https://dav.example.com/dav/"
               value={form.url}
               onChange={(e) => update("url", e.target.value)}
             />
@@ -278,7 +262,7 @@ function WebDAVModal({ config, onClose, onSavedAndSync }) {
             </label>
 
             <label className="field">
-              <span>App Password</span>
+              <span>Password</span>
               <div className="pwd-wrap">
                 <input
                   type={showPwd ? "text" : "password"}
@@ -325,7 +309,7 @@ function WebDAVModal({ config, onClose, onSavedAndSync }) {
               checked={form.useProxy}
               onChange={(e) => update("useProxy", e.target.checked)}
             />
-            <span>Use built-in CORS proxy (required for Jianguoyun)</span>
+            <span>Use built-in CORS proxy (recommended)</span>
           </label>
         </div>
 
@@ -413,6 +397,7 @@ export default function Home() {
         if (res.deletedLocal || res.deletedRemote) {
           parts.push(`×${res.deletedLocal + res.deletedRemote}`);
         }
+        if (res.librarySynced) parts.push("lib");
         setSyncMsg(parts.length ? `Synced ${parts.join(" ")}` : "Up to date");
         await refresh();
       } catch (err) {
@@ -667,7 +652,7 @@ export default function Home() {
               <button
                 className="tool-btn"
                 type="button"
-                title="Configure WebDAV sync (Jianguoyun)"
+                title="Configure WebDAV sync"
                 onClick={() => setDavModalOpen(true)}
               >
                 <svg

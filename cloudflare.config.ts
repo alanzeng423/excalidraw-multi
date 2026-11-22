@@ -6,6 +6,10 @@ const domains = process.env.WORKER_DOMAIN
       .filter(Boolean)
   : undefined;
 
+const sharesBinding = process.env.SHARE_KV_ID
+  ? bindings.kv({ id: process.env.SHARE_KV_ID })
+  : undefined;
+
 export default defineConfig({
   worker: {
     name: "excalidraw-multi",
@@ -16,6 +20,7 @@ export default defineConfig({
     ...(domains ? { domains } : {}),
     env: {
       ASSETS: bindings.assets(),
+      ...(sharesBinding ? { SHARES: sharesBinding } : {}),
     },
     assets: {
       htmlHandling: "auto-trailing-slash",

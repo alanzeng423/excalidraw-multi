@@ -1,8 +1,15 @@
 import {
+  mergeLibraryItems,
+  restoreLibraryItems,
+  serializeLibraryAsJSON,
+} from "@excalidraw/excalidraw";
+import {
   deleteBoardFromRemote,
   listBoards,
   listTombstones,
   loadBoard,
+  loadLibraryData,
+  saveLibraryData,
   stripAppState,
   upsertBoardFromRemote,
 } from "./storage";
@@ -10,11 +17,9 @@ import {
 const CONFIG_KEY = "excalidraw-multi:webdav-config";
 const LAST_SYNC_KEY = "excalidraw-multi:webdav-last-sync";
 
-export const JIANGUOYUN_URL = "https://dav.jianguoyun.com/dav/";
-
 export const DEFAULT_WEBDAV_CONFIG = {
   enabled: false,
-  url: JIANGUOYUN_URL,
+  url: "",
   username: "",
   password: "",
   folder: "excalidraw",
@@ -116,7 +121,7 @@ async function davFetch(config, targetUrl, options = {}) {
 
 async function formatDavError(res, context) {
   if (res.status === 401) {
-    return `${context}: Authentication failed (401). Check your email and app password.`;
+    return `${context}: Authentication failed (401). Check your username and password.`;
   }
   if (res.status === 403) {
     return `${context}: Access forbidden (403). Check WebDAV permissions or path.`;
@@ -138,7 +143,7 @@ async function ensureDirectories(config) {
     built.push(seg);
     const dirUrl = `${joinUrl(base, ...built)}/`;
     const res = await davFetch(config, dirUrl, { method: "MKCOL" });
-    // 201 Created, 200/204 OK, 405 Already Exists (standard WebDAV & Jianguoyun)
+    // 201 Created, 200/204 OK, 405 Already Exists (standard WebDAV)
     if (
       res.status === 200 ||
       res.status === 201 ||
@@ -154,7 +159,7 @@ async function ensureDirectories(config) {
 export async function testWebDAVConnection(config) {
   const base = normalizeBaseUrl(config.url);
   if (!config.username?.trim() || !config.password?.trim()) {
-    throw new Error("Username and app password are required.");
+    throw new Error("Username and password are required.");
   }
 
   const propfindBody =
@@ -180,9 +185,10 @@ function getRemotePaths(config) {
   const base = normalizeBaseUrl(config.url);
   const folderSegs = cleanFolderSegments(config.folder);
   const indexUrl = joinUrl(base, ...folderSegs, "index.json");
+  const libraryUrl = joinUrl(base, ...folderSegs, "library.excalidrawlib");
   const boardUrl = (id) =>
     joinUrl(base, ...folderSegs, "boards", `${id}.excalidraw`);
-  return { indexUrl, boardUrl };
+  return { indexUrl, libraryUrl, boardUrl };
 }
 
 let inFlightSync = null;
@@ -202,10 +208,10 @@ export function syncWithWebDAV(overrideConfig) {
 
 async function runSync(config) {
   await ensureDirectories(config);
-  const { indexUrl, boardUrl } = getRemotePaths(config);
+  const { indexUrl, libraryUrl, boardUrl } = getRemotePaths(config);
 
   // 1. Fetch remote index.json
-  let remoteIndex = { version: 1, boards: {} };
+  let remoteIndex = { version: 1, boards: {}, libraryUpdatedAt: 0 };
   let remoteIndexExists = false;
   const idxRes = await davFetch(config, indexUrl, { method: "GET" });
   if (idxRes.status === 200) {
@@ -213,10 +219,14 @@ async function runSync(config) {
     try {
       const parsed = await idxRes.json();
       if (parsed && typeof parsed === "object" && parsed.boards) {
-        remoteIndex = { version: 1, boards: { ...parsed.boards } };
+        remoteIndex = {
+          version: 1,
+          boards: { ...parsed.boards },
+          libraryUpdatedAt: Number(parsed.libraryUpdatedAt) || 0,
+        };
       }
     } catch {
-      remoteIndex = { version: 1, boards: {} };
+      remoteIndex = { version: 1, boards: {}, libraryUpdatedAt: 0 };
     }
   } else if (idxRes.status !== 404) {
     throw new Error(await formatDavError(idxRes, "Read index.json"));
@@ -243,7 +253,7 @@ async function runSync(config) {
   let deletedRemote = 0;
   let remoteDirty = !remoteIndexExists;
 
-  // 3. Two-way LWW merge per board (sequential to respect Jianguoyun rate limits)
+  // 3. Two-way LWW merge per board (sequential to respect server rate limits)
   for (const id of allIds) {
     const localBoard = localMap.get(id) || null;
     const localTomb = tombstoneMap.get(id) || null;
@@ -339,7 +349,68 @@ async function runSync(config) {
     }
   }
 
-  // 4. Write merged index.json if anything changed remotely
+  // 4. Two-way sync for Excalidraw library (library.excalidrawlib)
+  const localLib = await loadLibraryData();
+  const localLibItems = localLib.libraryItems || [];
+  const localLibTs = localLib.updatedAt || 0;
+  const remoteLibTs = remoteIndex.libraryUpdatedAt || 0;
+  let nextLibraryUpdatedAt = remoteLibTs;
+  let librarySynced = false;
+
+  if (remoteLibTs > localLibTs) {
+    const libRes = await davFetch(config, libraryUrl, { method: "GET" });
+    if (libRes.status === 200) {
+      let remoteItems = [];
+      try {
+        const parsed = await libRes.json();
+        const raw = parsed?.libraryItems || parsed?.library || [];
+        remoteItems = restoreLibraryItems(raw, "published");
+      } catch {
+        remoteItems = [];
+      }
+      const merged = mergeLibraryItems(localLibItems, remoteItems);
+      const remoteIdSet = new Set(remoteItems.map((it) => it.id));
+      const localAdded = merged.some((it) => !remoteIdSet.has(it.id));
+
+      if (localAdded) {
+        const now = Date.now();
+        await saveLibraryData(merged, now);
+        const putLib = await davFetch(config, libraryUrl, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/vnd.excalidrawlib+json; charset=utf-8",
+          },
+          body: serializeLibraryAsJSON(merged),
+        });
+        if (!putLib.ok && putLib.status !== 201 && putLib.status !== 204) {
+          throw new Error(await formatDavError(putLib, "Upload library"));
+        }
+        nextLibraryUpdatedAt = now;
+        remoteDirty = true;
+      } else {
+        await saveLibraryData(merged, remoteLibTs);
+      }
+      librarySynced = true;
+    } else if (libRes.status !== 404) {
+      throw new Error(await formatDavError(libRes, "Download library"));
+    }
+  } else if (localLibTs > remoteLibTs && (localLibItems.length > 0 || remoteLibTs > 0)) {
+    const putLib = await davFetch(config, libraryUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/vnd.excalidrawlib+json; charset=utf-8",
+      },
+      body: serializeLibraryAsJSON(localLibItems),
+    });
+    if (!putLib.ok && putLib.status !== 201 && putLib.status !== 204) {
+      throw new Error(await formatDavError(putLib, "Upload library"));
+    }
+    nextLibraryUpdatedAt = localLibTs;
+    remoteDirty = true;
+    librarySynced = true;
+  }
+
+  // 5. Write merged index.json if anything changed remotely
   if (remoteDirty) {
     const putIdx = await davFetch(config, indexUrl, {
       method: "PUT",
@@ -348,6 +419,7 @@ async function runSync(config) {
         {
           version: 1,
           updatedAt: Date.now(),
+          libraryUpdatedAt: nextLibraryUpdatedAt,
           boards: nextRemoteBoards,
         },
         null,
@@ -361,7 +433,7 @@ async function runSync(config) {
 
   const timestamp = Date.now();
   setLastSyncAt(timestamp);
-  return { pulled, pushed, deletedLocal, deletedRemote, timestamp };
+  return { pulled, pushed, deletedLocal, deletedRemote, librarySynced, timestamp };
 }
 
 let autoSyncTimer = null;

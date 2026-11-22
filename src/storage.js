@@ -11,6 +11,28 @@ const metaKey = (id) => `meta:${id}`;
 const sceneKey = (id) => `scene:${id}`;
 const filesKey = (id) => `files:${id}`;
 const tombstoneKey = (id) => `tombstone:${id}`;
+const LIBRARY_KEY = "library:items";
+
+export async function loadLibraryData() {
+  const saved = await get(LIBRARY_KEY, store);
+  if (!saved || !Array.isArray(saved.libraryItems)) {
+    return { libraryItems: [], updatedAt: 0 };
+  }
+  return {
+    libraryItems: saved.libraryItems,
+    updatedAt: Number(saved.updatedAt) || 0,
+  };
+}
+
+export async function saveLibraryData(libraryItems, updatedAt = Date.now()) {
+  const record = {
+    libraryItems: Array.isArray(libraryItems) ? libraryItems : [],
+    updatedAt,
+  };
+  await set(LIBRARY_KEY, record, store);
+  notify("library");
+  return record;
+}
 
 export function newId() {
   const bytes = crypto.getRandomValues(new Uint8Array(6));

@@ -4,6 +4,7 @@ import "@excalidraw/excalidraw/index.css";
 import { initNativeMarkdown } from "./nativeMarkdown";
 import Home from "./Home";
 import Board from "./Board";
+import ShareView from "./ShareView";
 import "./styles.css";
 
 initNativeMarkdown();
@@ -13,6 +14,7 @@ createRoot(document.getElementById("root")).render(
     <Routes>
       <Route path="/" element={<Home />} />
       <Route path="/board/:id" element={<Board />} />
+      <Route path="/share/:id" element={<ShareView />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   </BrowserRouter>

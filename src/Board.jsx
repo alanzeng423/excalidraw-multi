@@ -6,6 +6,7 @@ import {
   loadFromBlob,
   restoreElements,
   serializeAsJSON,
+  useHandleLibrary,
 } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css";
 import {
@@ -13,12 +14,15 @@ import {
   ensureBoard,
   getBoardMeta,
   loadBoard,
+  loadLibraryData,
   newId,
   renameBoard,
   saveBoard,
+  saveLibraryData,
   stripAppState,
 } from "./storage";
 import { scheduleAutoSync } from "./webdav";
+import { createShareLink } from "./share";
 import { DEFAULT_MARKDOWN, MARKDOWN_LINK } from "./markdown";
 import MarkdownCard from "./MarkdownCard";
 import {
@@ -26,6 +30,24 @@ import {
   measureNativeTextBox,
   setNativeMarkdownEnabled,
 } from "./nativeMarkdown";
+
+const LANG_KEY = "excalidraw-multi:lang";
+
+function getSavedLang() {
+  try {
+    const saved = localStorage.getItem(LANG_KEY);
+    return saved === "en" ? "en" : "zh-CN";
+  } catch {
+    return "zh-CN";
+  }
+}
+
+const SHARE_TTL_OPTIONS = [
+  { value: 604800, zh: "7 天", en: "7 days" },
+  { value: 2592000, zh: "30 天", en: "30 days" },
+  { value: 7776000, zh: "90 天", en: "90 days" },
+  { value: 0, zh: "永久", en: "Never" },
+];
 
 const FONT_FAMILY_NAMES = {
   1: "Virgil, Segoe UI Emoji",
@@ -58,14 +80,44 @@ function BoardCanvas({ id }) {
   const [readOnly, setReadOnly] = useState(false);
   const [deleted, setDeleted] = useState(false);
   const [nativeMd, setNativeMd] = useState(() => getNativeMarkdownEnabled());
+  const [langCode, setLangCode] = useState(getSavedLang);
+  const [shareOpen, setShareOpen] = useState(false);
 
   const readyRef = useRef(false);
   const readOnlyRef = useRef(false);
+  const librarySyncingRef = useRef(false);
   const timerRef = useRef(null);
   const pendingRef = useRef(null);
   const versionHashRef = useRef(-1);
   const fileIdsRef = useRef(new Set());
   const fileInputRef = useRef(null);
+
+  const libraryAdapter = useMemo(
+    () => ({
+      async load() {
+        const { libraryItems } = await loadLibraryData();
+        return { libraryItems };
+      },
+      async save({ libraryItems }) {
+        if (librarySyncingRef.current) return;
+        await saveLibraryData(libraryItems);
+        scheduleAutoSync(4000);
+      },
+    }),
+    []
+  );
+
+  useHandleLibrary({ excalidrawAPI: api, adapter: libraryAdapter });
+
+  const toggleLang = useCallback(() => {
+    setLangCode((prev) => {
+      const next = prev === "zh-CN" ? "en" : "zh-CN";
+      try {
+        localStorage.setItem(LANG_KEY, next);
+      } catch {}
+      return next;
+    });
+  }, []);
 
   const initialData = useMemo(
     () =>
@@ -172,6 +224,18 @@ function BoardCanvas({ id }) {
   useEffect(() => {
     if (!channel) return;
     const onMessage = async ({ data }) => {
+      if (data?.type === "library" && api) {
+        const { libraryItems } = await loadLibraryData();
+        librarySyncingRef.current = true;
+        try {
+          await api.updateLibrary({ libraryItems, merge: false });
+        } finally {
+          setTimeout(() => {
+            librarySyncingRef.current = false;
+          }, 50);
+        }
+        return;
+      }
       if (data?.id !== id) return;
       if (data.type === "deleted") {
         setDeleted(true);
@@ -427,13 +491,23 @@ function BoardCanvas({ id }) {
     }
   };
 
+  const isZh = langCode === "zh-CN";
+  const libraryReturnUrl =
+    typeof window !== "undefined"
+      ? `${window.location.origin}${window.location.pathname}`
+      : undefined;
+
   return (
     <div className="board">
       {(readOnly || deleted) && (
         <div className={`banner ${deleted ? "danger" : ""}`}>
           {deleted
-            ? "此画板已在其他标签页中被删除，当前修改不会再保存。"
-            : "此画板已在另一个标签页中打开，本页为只读（会自动同步显示）。关闭另一个标签页后刷新即可编辑。"}
+            ? isZh
+              ? "此画板已在其他标签页中被删除，当前修改不会再保存。"
+              : "This board was deleted in another tab; edits will not be saved."
+            : isZh
+              ? "此画板已在另一个标签页中打开，本页为只读（会自动同步显示）。关闭另一个标签页后刷新即可编辑。"
+              : "This board is open in another tab (read-only live mirror). Close the other tab and refresh to edit."}
         </div>
       )}
 
@@ -441,7 +515,8 @@ function BoardCanvas({ id }) {
         excalidrawAPI={setApi}
         initialData={initialData}
         onChange={handleChange}
-        langCode="zh-CN"
+        langCode={langCode}
+        libraryReturnUrl={libraryReturnUrl}
         viewModeEnabled={readOnly || undefined}
         validateEmbeddable={validateEmbeddable}
         renderEmbeddable={renderEmbeddable}
@@ -450,19 +525,23 @@ function BoardCanvas({ id }) {
           <div className="topbar">
             <button
               className="btn small"
-              title="返回画板列表"
+              title={isZh ? "返回画板列表" : "Back to boards"}
               onClick={() => {
                 flushSave();
                 navigate("/");
               }}
             >
-              ← 列表
+              {isZh ? "← 列表" : "← Boards"}
             </button>
             {!readOnly && (
               <>
                 <button
                   className={`btn small md-toggle-btn ${nativeMd ? "active" : ""}`}
-                  title={`原生文字 Markdown 排版：${nativeMd ? "已开启" : "已关闭"}（点击切换，支持自由文字与图形内文字）`}
+                  title={
+                    isZh
+                      ? `原生文字 Markdown 排版：${nativeMd ? "已开启" : "已关闭"}（点击切换，支持自由文字与图形内文字）`
+                      : `Native text Markdown: ${nativeMd ? "ON" : "OFF"} (click to toggle)`
+                  }
                   aria-pressed={nativeMd}
                   onClick={handleToggleNativeMd}
                 >
@@ -471,17 +550,40 @@ function BoardCanvas({ id }) {
                 </button>
                 <button
                   className="btn small md-insert-btn"
-                  title="插入 Markdown 卡片 (Alt+M)"
+                  title={isZh ? "插入 Markdown 卡片 (Alt+M)" : "Insert Markdown card (Alt+M)"}
                   onClick={handleInsertMarkdownCard}
                 >
                   +MD
                 </button>
               </>
             )}
+            <button
+              className="btn small share-open-btn"
+              title={isZh ? "生成端到端加密只读分享链接" : "Create encrypted read-only share link"}
+              onClick={() => setShareOpen(true)}
+            >
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="18" cy="5" r="3" />
+                <circle cx="6" cy="12" r="3" />
+                <circle cx="18" cy="19" r="3" />
+                <path d="m8.59 13.51 6.83 3.98M15.41 6.51l-6.82 3.98" />
+              </svg>
+              <span>{isZh ? "分享" : "Share"}</span>
+            </button>
             <input
               className="title-input"
               value={title}
-              aria-label="画板名称"
+              aria-label={isZh ? "画板名称" : "Board title"}
               onChange={(e) => setTitle(e.target.value)}
               onBlur={handleTitleBlur}
               onKeyDown={(e) => {
@@ -502,36 +604,57 @@ function BoardCanvas({ id }) {
               navigate("/");
             }}
           >
-            ← 返回画板列表
+            {isZh ? "← 返回画板列表" : "← Back to boards"}
           </MainMenu.Item>
           <MainMenu.Item onSelect={() => window.open("/", "_blank")}>
-            在新标签页打开列表
+            {isZh ? "在新标签页打开列表" : "Open boards in new tab"}
           </MainMenu.Item>
           <MainMenu.Separator />
           {!readOnly && (
             <>
               <MainMenu.Item onSelect={handleToggleNativeMd}>
-                原生文字 Markdown 排版：{nativeMd ? "已开启" : "已关闭"}
+                {isZh
+                  ? `原生文字 Markdown 排版：${nativeMd ? "已开启" : "已关闭"}`
+                  : `Native text Markdown: ${nativeMd ? "ON" : "OFF"}`}
               </MainMenu.Item>
               <MainMenu.Item onSelect={handleInsertMarkdownCard}>
-                插入 Markdown 卡片 (Alt+M)
+                {isZh ? "插入 Markdown 卡片 (Alt+M)" : "Insert Markdown card (Alt+M)"}
               </MainMenu.Item>
             </>
           )}
+          <MainMenu.Item onSelect={() => setShareOpen(true)}>
+            {isZh ? "生成只读分享链接" : "Create read-only share link"}
+          </MainMenu.Item>
           <MainMenu.Item onSelect={handleExport}>
-            导出 .excalidraw 文件
+            {isZh ? "导出 .excalidraw 文件" : "Export .excalidraw file"}
           </MainMenu.Item>
           <MainMenu.Item onSelect={() => fileInputRef.current?.click()}>
-            导入 .excalidraw 文件
+            {isZh ? "导入 .excalidraw 文件" : "Import .excalidraw file"}
           </MainMenu.Item>
           <MainMenu.DefaultItems.SaveAsImage />
           <MainMenu.Separator />
+          <MainMenu.DefaultItems.SearchMenu />
+          <MainMenu.DefaultItems.CommandPalette />
           <MainMenu.DefaultItems.ClearCanvas />
+          <MainMenu.Separator />
           <MainMenu.DefaultItems.ToggleTheme />
+          <MainMenu.Item onSelect={toggleLang}>
+            {isZh ? "语言 / Language：中文 → English" : "Language / 语言: English → 中文"}
+          </MainMenu.Item>
           <MainMenu.DefaultItems.ChangeCanvasBackground />
           <MainMenu.DefaultItems.Help />
         </MainMenu>
       </Excalidraw>
+
+      {shareOpen && (
+        <ShareModal
+          api={api}
+          title={title}
+          langCode={langCode}
+          dark={api?.getAppState()?.theme === "dark"}
+          onClose={() => setShareOpen(false)}
+        />
+      )}
 
       <input
         ref={fileInputRef}
@@ -543,6 +666,209 @@ function BoardCanvas({ id }) {
           e.target.value = "";
         }}
       />
+    </div>
+  );
+}
+
+function ShareModal({ api, title, langCode, dark, onClose }) {
+  const isZh = langCode === "zh-CN";
+  const [ttl, setTtl] = useState(7776000);
+  const [creating, setCreating] = useState(false);
+  const [shareUrl, setShareUrl] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const handleCreate = async () => {
+    if (!api || creating) return;
+    setCreating(true);
+    setError("");
+    setCopied(false);
+    try {
+      const elements = api.getSceneElements().filter((el) => !el.isDeleted);
+      const appState = stripAppState(api.getAppState());
+      const allFiles = api.getFiles() || {};
+      const usedFileIds = new Set(
+        elements.filter((el) => el.fileId).map((el) => el.fileId)
+      );
+      const files = {};
+      for (const fid of usedFileIds) {
+        if (allFiles[fid]) files[fid] = allFiles[fid];
+      }
+      const url = await createShareLink({
+        title: title || "Untitled",
+        elements,
+        appState,
+        files,
+        ttl,
+      });
+      setShareUrl(url);
+    } catch (err) {
+      setError(err?.message || String(err));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const handleCopy = async () => {
+    if (!shareUrl) return;
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      const input = document.querySelector(".share-url-input");
+      input?.select();
+      document.execCommand?.("copy");
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  return (
+    <div
+      className={`modal-backdrop ${dark ? "theme-dark" : ""}`}
+      role="dialog"
+      aria-modal="true"
+      aria-label={isZh ? "只读分享链接" : "Read-only share link"}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="island modal-card share-modal">
+        <div className="modal-head">
+          <div>
+            <h3>{isZh ? "生成只读分享链接" : "Read-only share link"}</h3>
+            <p className="modal-sub">
+              {isZh
+                ? "创建当前画板的端到端加密只读快照"
+                : "Create an end-to-end encrypted read-only snapshot"}
+            </p>
+          </div>
+          <button
+            className="tile-icon-btn"
+            type="button"
+            aria-label={isZh ? "关闭" : "Close"}
+            onClick={onClose}
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+            >
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        <div className="share-ttl-section">
+          <span className="share-field-label">
+            {isZh ? "链接有效期" : "Expires after"}
+          </span>
+          <div className="share-ttl-group">
+            {SHARE_TTL_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                className={`preset-chip ${ttl === opt.value ? "active" : ""}`}
+                onClick={() => {
+                  setTtl(opt.value);
+                  setShareUrl("");
+                  setError("");
+                }}
+              >
+                {isZh ? opt.zh : opt.en}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {shareUrl && (
+          <div className="share-result">
+            <input
+              className="share-url-input"
+              type="text"
+              readOnly
+              value={shareUrl}
+              onFocus={(e) => e.target.select()}
+            />
+            <button
+              type="button"
+              className="tool-btn primary"
+              onClick={handleCopy}
+            >
+              {copied
+                ? isZh
+                  ? "已复制"
+                  : "Copied"
+                : isZh
+                  ? "复制"
+                  : "Copy"}
+            </button>
+          </div>
+        )}
+
+        {error && <div className="modal-feedback err">{error}</div>}
+
+        <p className="share-e2e-note">
+          {isZh
+            ? "端到端加密：内容在浏览器内使用 AES-GCM 加密，解密密钥仅保存在链接 # 片段中，不会发送到服务器。"
+            : "End-to-end encrypted: content is AES-GCM encrypted in your browser. The key lives only in the URL #fragment and is never sent to the server."}
+        </p>
+
+        <div className="modal-foot">
+          <div className="modal-foot-left">
+            {shareUrl && (
+              <a
+                className="tool-btn outline"
+                href={shareUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {isZh ? "打开预览" : "Open link"}
+              </a>
+            )}
+          </div>
+          <div className="modal-foot-right">
+            <button
+              type="button"
+              className="tool-btn outline"
+              onClick={onClose}
+            >
+              {isZh ? "关闭" : "Close"}
+            </button>
+            <button
+              type="button"
+              className="tool-btn primary"
+              disabled={creating}
+              onClick={handleCreate}
+            >
+              {creating
+                ? isZh
+                  ? "加密上传中…"
+                  : "Creating…"
+                : shareUrl
+                  ? isZh
+                    ? "重新生成"
+                    : "Regenerate"
+                  : isZh
+                    ? "生成链接"
+                    : "Create link"}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

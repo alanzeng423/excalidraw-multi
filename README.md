@@ -7,7 +7,10 @@ Multi-board [Excalidraw](https://excalidraw.com/) hosted on Cloudflare Workers (
 - **Custom Canvas Fonts** — replaces Excalidraw's default `Xiaolai` CJK fallback with **LXGW WenKai Screen (霞鹜文楷)** (97 unicode-range `.woff2` subsets), and adds 5 self-hosted English fonts (**Shantell Sans**, **Google Sans**, **Open Sans**, **Playwrite AR Guides**, **Bentham**) directly to Excalidraw's font picker with LXGW WenKai CJK fallback.
 - **Native Text Box Markdown** — toggleable (`MD` switch in top bar) Canvas & SVG Markdown rendering directly inside Excalidraw's native text boxes and shape-bound text (`# / ## / ###` headings, `**bold**`, `*italic*`, `~~strike~~`, `` `code` ``, `==highlight==`, `- bullets`, `- [x]` checkboxes, `> quotes`), preserving your chosen font, color, alignment, and PNG/SVG export.
 - **Canvas Markdown Cards (GFM + KaTeX)** — insert draggable, resizable, arrow-connectable Markdown cards (`+MD` / `Alt+M`) with Preview / Edit / Split modes, interactive task checkboxes, tables, code blocks, and LaTeX math, synced via IndexedDB and WebDAV.
-- **WebDAV Sync (Jianguoyun-ready)** — built-in Cloudflare Worker CORS proxy (`/api/webdav`) with SSRF protection, storing standard `.excalidraw` files and an `index.json` manifest (with deletion tombstones) for two-way sync across devices.
+- **Excalidraw Library Persistence & Sync** — persists library items across reloads and tabs in IndexedDB, supports one-click install from [libraries.excalidraw.com](https://libraries.excalidraw.com/), and syncs `library.excalidrawlib` over WebDAV.
+- **End-to-End Encrypted Read-Only Share Links** — generates shareable `/share/:id#key=...` links encrypted in-browser with AES-GCM (the decryption key stays in the URL `#fragment` and is never sent to the server), stored in Cloudflare KV with configurable expiration and one-click "Copy to my boards".
+- **WebDAV Sync** — built-in Cloudflare Worker CORS proxy (`/api/webdav`) with SSRF protection, storing standard `.excalidraw` boards, `library.excalidrawlib`, and an `index.json` manifest (with deletion tombstones) for two-way sync across devices.
+- **Complete Menu & Bilingual UI** — includes Canvas Search, Command Palette (`Ctrl/Cmd+/`), Theme Switcher, and persisted `zh-CN` / `en` language toggle.
 
 ## Development & Deployment
 
@@ -23,3 +26,4 @@ npm run deploy           # deploy to Cloudflare Workers via cf deploy
 
 - `CLOUDFLARE_ACCOUNT_ID`: Cloudflare account ID (injected automatically in Cloudflare Workers Builds).
 - `WORKER_DOMAIN`: Custom domain(s), comma-separated (e.g. `draw.example.com`). When omitted, deploys to `*.workers.dev`.
+- `SHARE_KV_ID`: Cloudflare KV namespace ID for storing encrypted read-only share snapshots (`SHARES` binding).
