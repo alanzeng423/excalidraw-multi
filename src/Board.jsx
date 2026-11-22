@@ -4,6 +4,7 @@ import {
   Excalidraw,
   MainMenu,
   loadFromBlob,
+  restoreElements,
   serializeAsJSON,
 } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css";
@@ -12,11 +13,14 @@ import {
   ensureBoard,
   getBoardMeta,
   loadBoard,
+  newId,
   renameBoard,
   saveBoard,
   stripAppState,
 } from "./storage";
 import { scheduleAutoSync } from "./webdav";
+import { DEFAULT_MARKDOWN, MARKDOWN_LINK } from "./markdown";
+import MarkdownCard from "./MarkdownCard";
 
 const SAVE_DEBOUNCE_MS = 600;
 
@@ -46,7 +50,7 @@ function BoardCanvas({ id }) {
       (async () => {
         const meta = await ensureBoard(id);
         setTitle(meta.title);
-        document.title = `${meta.title} · 画板`;
+        document.title = `${meta.title} · Excalidraw`;
         const { scene, files } = await loadBoard(id);
         fileIdsRef.current = new Set(Object.keys(files));
         versionHashRef.current = hashElements(scene?.elements || []);
@@ -154,7 +158,7 @@ function BoardCanvas({ id }) {
         const meta = await getBoardMeta(id);
         if (meta) {
           setTitle(meta.title);
-          document.title = `${meta.title} · 画板`;
+          document.title = `${meta.title} · Excalidraw`;
         }
       }
       if (data.type === "saved" && readOnlyRef.current && api) {
@@ -168,6 +172,126 @@ function BoardCanvas({ id }) {
     channel.addEventListener("message", onMessage);
     return () => channel.removeEventListener("message", onMessage);
   }, [id, api]);
+
+  const handleInsertMarkdownCard = useCallback(() => {
+    if (!api || readOnlyRef.current) return;
+    const appState = api.getAppState();
+    const zoom = appState.zoom?.value || 1;
+    const cardW = 420;
+    const cardH = 340;
+    const centerX = -appState.scrollX + appState.width / (2 * zoom);
+    const centerY = -appState.scrollY + appState.height / (2 * zoom);
+
+    const [card] = restoreElements(
+      [
+        {
+          type: "embeddable",
+          id: `md_${newId()}`,
+          x: Math.round(centerX - cardW / 2),
+          y: Math.round(centerY - cardH / 2),
+          width: cardW,
+          height: cardH,
+          link: MARKDOWN_LINK,
+          strokeColor: appState.theme === "dark" ? "#4a4a5a" : "#d0d0dc",
+          backgroundColor: "transparent",
+          strokeWidth: 1,
+          roughness: 0,
+          roundness: { type: 3, value: 12 },
+          customData: {
+            type: "markdown",
+            markdown: DEFAULT_MARKDOWN,
+          },
+        },
+      ],
+      null
+    );
+
+    const current = api.getSceneElementsIncludingDeleted();
+    api.updateScene({
+      elements: [...current, card],
+      appState: {
+        selectedElementIds: { [card.id]: true },
+        activeEmbeddable: { element: card, state: "active" },
+      },
+    });
+  }, [api]);
+
+  const handleUpdateMarkdown = useCallback(
+    (elementId, nextMarkdown) => {
+      if (!api || readOnlyRef.current) return;
+      const elements = api.getSceneElementsIncludingDeleted();
+      let changed = false;
+      const nextElements = elements.map((el) => {
+        if (el.id !== elementId) return el;
+        changed = true;
+        return {
+          ...el,
+          version: (el.version || 0) + 1,
+          versionNonce: Math.floor(Math.random() * 2147483647),
+          updated: Date.now(),
+          customData: {
+            ...(el.customData || {}),
+            type: "markdown",
+            markdown: nextMarkdown,
+          },
+        };
+      });
+      if (changed) {
+        api.updateScene({ elements: nextElements });
+      }
+    },
+    [api]
+  );
+
+  // Alt+M shortcut to insert a Markdown card
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (
+        e.altKey &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        e.key.toLowerCase() === "m" &&
+        document.activeElement?.tagName !== "INPUT" &&
+        document.activeElement?.tagName !== "TEXTAREA"
+      ) {
+        e.preventDefault();
+        handleInsertMarkdownCard();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handleInsertMarkdownCard]);
+
+  const validateEmbeddable = useCallback((link) => {
+    if (typeof link === "string" && link.startsWith("markdown://")) {
+      return true;
+    }
+    return undefined;
+  }, []);
+
+  const renderEmbeddable = useCallback(
+    (element, appState) => {
+      if (
+        element.customData?.type === "markdown" ||
+        element.link?.startsWith("markdown://")
+      ) {
+        const isActive =
+          appState.activeEmbeddable?.element?.id === element.id &&
+          appState.activeEmbeddable?.state === "active";
+        return (
+          <MarkdownCard
+            element={element}
+            theme={appState.theme}
+            isActive={isActive}
+            readOnly={readOnly}
+            onUpdate={handleUpdateMarkdown}
+          />
+        );
+      }
+      return null;
+    },
+    [readOnly, handleUpdateMarkdown]
+  );
 
   const handleTitleBlur = async () => {
     const nextTitle = title.trim() || "Untitled";
@@ -187,7 +311,7 @@ function BoardCanvas({ id }) {
     const blob = new Blob([json], { type: "application/vnd.excalidraw+json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `${(title || "画板").replace(/[\\/:*?"<>|]/g, "_")}.excalidraw`;
+    a.download = `${(title || "board").replace(/[\\/:*?"<>|]/g, "_")}.excalidraw`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   };
@@ -238,6 +362,8 @@ function BoardCanvas({ id }) {
         onChange={handleChange}
         langCode="zh-CN"
         viewModeEnabled={readOnly || undefined}
+        validateEmbeddable={validateEmbeddable}
+        renderEmbeddable={renderEmbeddable}
         UIOptions={{ canvasActions: { toggleTheme: true } }}
         renderTopRightUI={() => (
           <div className="topbar">
@@ -251,6 +377,15 @@ function BoardCanvas({ id }) {
             >
               ← 列表
             </button>
+            {!readOnly && (
+              <button
+                className="btn small md-insert-btn"
+                title="插入 Markdown 卡片 (Alt+M)"
+                onClick={handleInsertMarkdownCard}
+              >
+                + MD
+              </button>
+            )}
             <input
               className="title-input"
               value={title}
@@ -281,6 +416,11 @@ function BoardCanvas({ id }) {
             在新标签页打开列表
           </MainMenu.Item>
           <MainMenu.Separator />
+          {!readOnly && (
+            <MainMenu.Item onSelect={handleInsertMarkdownCard}>
+              插入 Markdown 卡片 (Alt+M)
+            </MainMenu.Item>
+          )}
           <MainMenu.Item onSelect={handleExport}>
             导出 .excalidraw 文件
           </MainMenu.Item>
