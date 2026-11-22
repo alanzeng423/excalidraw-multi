@@ -25,6 +25,7 @@ import { scheduleAutoSync } from "./webdav";
 import { createShareLink } from "./share";
 import { DEFAULT_MARKDOWN, MARKDOWN_LINK } from "./markdown";
 import MarkdownCard from "./MarkdownCard";
+import TextStylePanel from "./TextStylePanel";
 import {
   getNativeMarkdownEnabled,
   measureNativeTextBox,
@@ -317,6 +318,12 @@ function BoardCanvas({ id }) {
 
     api.updateScene({ elements: nextElements });
   }, [api]);
+
+  const handleEnsureNativeMd = useCallback(() => {
+    if (!getNativeMarkdownEnabled()) {
+      handleToggleNativeMd();
+    }
+  }, [handleToggleNativeMd]);
 
   const handleInsertMarkdownCard = useCallback(() => {
     if (!api || readOnlyRef.current) return;
@@ -645,6 +652,15 @@ function BoardCanvas({ id }) {
           <MainMenu.DefaultItems.Help />
         </MainMenu>
       </Excalidraw>
+
+      <TextStylePanel
+        api={api}
+        langCode={langCode}
+        nativeMd={nativeMd}
+        onToggleNativeMd={handleToggleNativeMd}
+        onEnsureNativeMd={handleEnsureNativeMd}
+        readOnly={readOnly}
+      />
 
       {shareOpen && (
         <ShareModal
