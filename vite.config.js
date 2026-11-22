@@ -177,6 +177,55 @@ function excalidrawCustomFontsPlugin() {
       `n("Virgil",...$1),n(Mn,...${lxgwList})${initRegistrations}`
     );
 
+    // 5. Native Markdown hooks for Excalidraw text measurement, Canvas draw, cache, and SVG export
+    const enPattern = /En=\(e,t\)=>\(Ao\|\|\(Ao=new oa\),Ao\.getLineWidth\(e,t\)\)/;
+    if (!enPattern.test(out)) {
+      throw new Error("Could not find Excalidraw En line-width helper to patch");
+    }
+    out = out.replace(
+      enPattern,
+      `En=(e,t)=>{Ao||(Ao=new oa);const _md=globalThis.__EXCALIDRAW_MD__;if(_md?.enabled)return _md.measureLineWidth(Ao.canvas.getContext("2d"),e,t,Ot());return Ao.getLineWidth(e,t)}`
+    );
+
+    const b6Pattern = /B6=\(e,t,n\)=>\{let r=aa\(e\)\.length;return Zn\(t,n\)\*r\}/;
+    if (!b6Pattern.test(out)) {
+      throw new Error("Could not find Excalidraw B6 block-height helper to patch");
+    }
+    out = out.replace(
+      b6Pattern,
+      `B6=(e,t,n)=>{const _md=globalThis.__EXCALIDRAW_MD__;if(_md?.enabled)return _md.measureBlockHeight(aa(e),t,n);let r=aa(e).length;return Zn(t,n)*r}`
+    );
+
+    const canvasDrawPattern = /for\(let U=0;U<s\.length;U\+\+\)n\.fillText\(s\[U\],d,U\*c\+l\);/;
+    if (!canvasDrawPattern.test(out)) {
+      throw new Error("Could not find Excalidraw Canvas text draw loop to patch");
+    }
+    out = out.replace(
+      canvasDrawPattern,
+      `const _md=globalThis.__EXCALIDRAW_MD__;if(_md?.enabled){_md.drawCanvasText(n,e,s,{fontFamilyStr:ea(e),lineHeightPx:c,baselineOffset:(fs,lh)=>Go(e.fontFamily,fs,lh),isDark:o.theme==="dark"})}else{for(let U=0;U<s.length;U++)n.fillText(s[U],d,U*c+l);}`
+    );
+
+    const cachePattern =
+      /if\(!i\|\|a\|\|i\.theme!==r\.theme\|\|i\.boundTextElementVersion!==d\|\|i\.imageCrop!==c\|\|i\.containingFrameOpacity!==l\|\|ee\(e\)&&s&&e\.angle!==i\.angle\)\{let U=K1\(e,t,o,n,r\);return U\?\(Jo\.set\(e,U\),U\):null\}/;
+    if (!cachePattern.test(out)) {
+      throw new Error("Could not find Excalidraw Canvas element cache F1 to patch");
+    }
+    out = out.replace(
+      cachePattern,
+      `const _mdOn=Boolean(globalThis.__EXCALIDRAW_MD__?.enabled);if(!i||a||i.theme!==r.theme||i.mdEnabled!==_mdOn||i.boundTextElementVersion!==d||i.imageCrop!==c||i.containingFrameOpacity!==l||ee(e)&&s&&e.angle!==i.angle){let U=K1(e,t,o,n,r);return U?(U.mdEnabled=_mdOn,Jo.set(e,U),U):null}`
+    );
+
+    const svgTextPattern =
+      /for\(let B=0;B<w\.length;B\+\+\)\{let _=r\.ownerDocument\.createElementNS\(re,"text"\);_\.textContent=w\[B\],_\.setAttribute\("x",`\$\{S\}`\),_\.setAttribute\("y",`\$\{B\*I\+v\}`\),_\.setAttribute\("font-family",ea\(e\)\),_\.setAttribute\("font-size",`\$\{e\.fontSize\}px`\),_\.setAttribute\("fill",e\.strokeColor\),_\.setAttribute\("text-anchor",\$\),_\.setAttribute\("style","white-space: pre;"\),_\.setAttribute\("direction",D\),_\.setAttribute\("dominant-baseline","alphabetic"\),y\.appendChild\(_\)\}/;
+    if (!svgTextPattern.test(out)) {
+      throw new Error("Could not find Excalidraw SVG text export loop to patch");
+    }
+    out = out.replace(
+      svgTextPattern,
+      (orig) =>
+        `const _md=globalThis.__EXCALIDRAW_MD__;if(_md?.enabled){_md.appendSvgText(r.ownerDocument,re,y,e,w,{fontFamilyStr:ea(e),lineHeightPx:I,baselineOffset:(fs,lh)=>Go(e.fontFamily,fs,lh),direction:D,isDark:Boolean(s.exportWithDarkMode)})}else{${orig}}`
+    );
+
     return out;
   };
 

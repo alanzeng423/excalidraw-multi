@@ -21,6 +21,27 @@ import {
 import { scheduleAutoSync } from "./webdav";
 import { DEFAULT_MARKDOWN, MARKDOWN_LINK } from "./markdown";
 import MarkdownCard from "./MarkdownCard";
+import {
+  getNativeMarkdownEnabled,
+  measureNativeTextBox,
+  setNativeMarkdownEnabled,
+} from "./nativeMarkdown";
+
+const FONT_FAMILY_NAMES = {
+  1: "Virgil, Segoe UI Emoji",
+  2: "Helvetica, Segoe UI Emoji",
+  3: "Cascadia, Segoe UI Emoji",
+  5: "Excalifont, Xiaolai, Segoe UI Emoji",
+  6: "Nunito, Segoe UI Emoji",
+  7: "Lilita One, Segoe UI Emoji",
+  8: "Comic Shanns, Segoe UI Emoji",
+  9: "Liberation Sans, Segoe UI Emoji",
+  10: "Shantell Sans, Xiaolai, Segoe UI Emoji",
+  11: "Google Sans, Xiaolai, Segoe UI Emoji",
+  12: "Open Sans, Xiaolai, Segoe UI Emoji",
+  13: "Playwrite AR Guides, Xiaolai, Segoe UI Emoji",
+  14: "Bentham, Xiaolai, Segoe UI Emoji",
+};
 
 const SAVE_DEBOUNCE_MS = 600;
 
@@ -36,6 +57,7 @@ function BoardCanvas({ id }) {
   const [status, setStatus] = useState("");
   const [readOnly, setReadOnly] = useState(false);
   const [deleted, setDeleted] = useState(false);
+  const [nativeMd, setNativeMd] = useState(() => getNativeMarkdownEnabled());
 
   const readyRef = useRef(false);
   const readOnlyRef = useRef(false);
@@ -172,6 +194,65 @@ function BoardCanvas({ id }) {
     channel.addEventListener("message", onMessage);
     return () => channel.removeEventListener("message", onMessage);
   }, [id, api]);
+
+  const handleToggleNativeMd = useCallback(() => {
+    const next = setNativeMarkdownEnabled(!getNativeMarkdownEnabled());
+    setNativeMd(next);
+    if (!api) return;
+
+    const elements = api.getSceneElementsIncludingDeleted();
+    const byId = new Map(elements.map((el) => [el.id, el]));
+    const touchedContainers = new Set();
+    for (const el of elements) {
+      if (!el.isDeleted && el.type === "text" && el.containerId) {
+        touchedContainers.add(el.containerId);
+      }
+    }
+
+    const nextElements = elements.map((el) => {
+      if (el.isDeleted) return el;
+      if (el.type === "text") {
+        const fontFamilyStr =
+          FONT_FAMILY_NAMES[el.fontFamily] || FONT_FAMILY_NAMES[5];
+        const measured = measureNativeTextBox(
+          el.text,
+          el.fontSize || 20,
+          fontFamilyStr,
+          el.lineHeight || 1.25
+        );
+        const container = el.containerId ? byId.get(el.containerId) : null;
+        let nextX = el.x;
+        let nextY = el.y;
+        let nextW = measured.width;
+        let nextH = measured.height;
+        if (container && container.type !== "arrow" && container.type !== "line") {
+          const pad = 10;
+          nextW = Math.min(measured.width, Math.max(20, container.width - pad * 2));
+          nextX = container.x + (container.width - nextW) / 2;
+          nextY = container.y + (container.height - nextH) / 2;
+        }
+        return {
+          ...el,
+          x: nextX,
+          y: nextY,
+          width: nextW,
+          height: nextH,
+          version: (el.version || 0) + 1,
+          versionNonce: Math.floor(Math.random() * 2147483647),
+        };
+      }
+      if (touchedContainers.has(el.id)) {
+        return {
+          ...el,
+          version: (el.version || 0) + 1,
+          versionNonce: Math.floor(Math.random() * 2147483647),
+        };
+      }
+      return el;
+    });
+
+    api.updateScene({ elements: nextElements });
+  }, [api]);
 
   const handleInsertMarkdownCard = useCallback(() => {
     if (!api || readOnlyRef.current) return;
@@ -378,13 +459,24 @@ function BoardCanvas({ id }) {
               ← 列表
             </button>
             {!readOnly && (
-              <button
-                className="btn small md-insert-btn"
-                title="插入 Markdown 卡片 (Alt+M)"
-                onClick={handleInsertMarkdownCard}
-              >
-                + MD
-              </button>
+              <>
+                <button
+                  className={`btn small md-toggle-btn ${nativeMd ? "active" : ""}`}
+                  title={`原生文字 Markdown 排版：${nativeMd ? "已开启" : "已关闭"}（点击切换，支持自由文字与图形内文字）`}
+                  aria-pressed={nativeMd}
+                  onClick={handleToggleNativeMd}
+                >
+                  <span className="md-dot" aria-hidden="true" />
+                  MD
+                </button>
+                <button
+                  className="btn small md-insert-btn"
+                  title="插入 Markdown 卡片 (Alt+M)"
+                  onClick={handleInsertMarkdownCard}
+                >
+                  +MD
+                </button>
+              </>
             )}
             <input
               className="title-input"
@@ -417,9 +509,14 @@ function BoardCanvas({ id }) {
           </MainMenu.Item>
           <MainMenu.Separator />
           {!readOnly && (
-            <MainMenu.Item onSelect={handleInsertMarkdownCard}>
-              插入 Markdown 卡片 (Alt+M)
-            </MainMenu.Item>
+            <>
+              <MainMenu.Item onSelect={handleToggleNativeMd}>
+                原生文字 Markdown 排版：{nativeMd ? "已开启" : "已关闭"}
+              </MainMenu.Item>
+              <MainMenu.Item onSelect={handleInsertMarkdownCard}>
+                插入 Markdown 卡片 (Alt+M)
+              </MainMenu.Item>
+            </>
           )}
           <MainMenu.Item onSelect={handleExport}>
             导出 .excalidraw 文件

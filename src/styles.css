@@ -971,6 +971,40 @@ body {
 
 /* ===== Canvas Embedded Markdown Cards ===== */
 
+.md-toggle-btn {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  gap: 5px;
+}
+
+.md-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #b0b0be;
+}
+
+.md-toggle-btn.active {
+  color: #1b8a4b;
+  border-color: #b7ebd0;
+  background: #edfaf2;
+}
+
+.md-toggle-btn.active .md-dot {
+  background: #1b8a4b;
+}
+
+.excalidraw.theme--dark .md-toggle-btn.active {
+  background: #183424;
+  border-color: #295c3e;
+  color: #4cd485;
+}
+
+.excalidraw.theme--dark .md-toggle-btn.active .md-dot {
+  background: #4cd485;
+}
+
 .md-insert-btn {
   font-weight: 600;
   color: var(--accent-soft-text);
