@@ -226,6 +226,45 @@ function excalidrawCustomFontsPlugin() {
         `const _md=globalThis.__EXCALIDRAW_MD__;if(_md?.enabled){_md.appendSvgText(r.ownerDocument,re,y,e,w,{fontFamilyStr:ea(e),lineHeightPx:I,baselineOffset:(fs,lh)=>Go(e.fontFamily,fs,lh),direction:D,isDark:Boolean(s.exportWithDarkMode)})}else{${orig}}`
     );
 
+    // 6. Interactive Table Card hooks for PNG export (Canvas) and SVG export / board previews
+    const canvasEmbedPattern =
+      /case"rectangle":case"iframe":case"embeddable":case"diamond":case"ellipse":\{n\.lineJoin="round",n\.lineCap="round",t\.draw\(he\.get\(e\)\);break\}/;
+    if (!canvasEmbedPattern.test(out)) {
+      throw new Error("Could not find Excalidraw Canvas embeddable branch to patch");
+    }
+    out = out.replace(
+      canvasEmbedPattern,
+      `case"rectangle":case"iframe":case"embeddable":case"diamond":case"ellipse":{n.lineJoin="round",n.lineCap="round",t.draw(he.get(e));if(e.type==="embeddable"&&r?.isExporting&&e.customData?.type==="table"){globalThis.__EXCALIDRAW_TABLE__?.drawCanvasTable(n,e,o?.theme==="dark")}break}`
+    );
+
+    const svgEmbedPattern =
+      /let S=Ii\(e\);wi\(S,t,n,g,o,S\.x\+d\.x-e\.x,S\.y\+d\.y-e\.y,s\);let v=jr\(n,y,qn\);for\(v\.setAttribute\("stroke-linecap","round"\),v\.setAttribute\("transform",`translate\(\$\{i\|\|0\} \$\{a\|\|0\}\) rotate\(\$\{E\} \$\{m\} \$\{b\}\)`\);v\.firstChild;\)v\.removeChild\(v\.firstChild\);let D=it\(Math\.min\(e\.width,e\.height\),e\),\$\=V2\(T2\(e\.link\|\|""\)\);if\(s\.renderEmbeddables===!1\|\|\$\?\.type==="document"\)\{let N=r\.ownerDocument\.createElementNS\(re,"a"\);/;
+    if (!svgEmbedPattern.test(out)) {
+      throw new Error("Could not find Excalidraw SVG embeddable branch to patch");
+    }
+    out = out.replace(
+      svgEmbedPattern,
+      (orig) =>
+        orig
+          .replace(
+            `let S=Ii(e);wi(S,t,n,g,o,S.x+d.x-e.x,S.y+d.y-e.y,s);`,
+            `if(e.customData?.type!=="table"){let S=Ii(e);wi(S,t,n,g,o,S.x+d.x-e.x,S.y+d.y-e.y,s);}`
+          )
+          .replace(
+            `if(s.renderEmbeddables===!1||$?.type==="document"){let N=r.ownerDocument.createElementNS(re,"a");`,
+            `if(e.customData?.type==="table"&&globalThis.__EXCALIDRAW_TABLE__?.appendSvgTable){globalThis.__EXCALIDRAW_TABLE__.appendSvgTable(r.ownerDocument,re,v,e,Boolean(s.exportWithDarkMode));h(v,e);break}if(s.renderEmbeddables===!1||$?.type==="document"){let N=r.ownerDocument.createElementNS(re,"a");`
+          )
+    );
+
+    const canvasPlaceholderPattern = /\{let x=Ii\(E\);Fn\(x,n,r,t,p,s,a\)\}/;
+    if (!canvasPlaceholderPattern.test(out)) {
+      throw new Error("Could not find Excalidraw Canvas embeddable placeholder to patch");
+    }
+    out = out.replace(
+      canvasPlaceholderPattern,
+      `{if(E.customData?.type!=="table"){let x=Ii(E);Fn(x,n,r,t,p,s,a)}}`
+    );
+
     return out;
   };
 

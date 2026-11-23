@@ -25,6 +25,8 @@ import { scheduleAutoSync } from "./webdav";
 import { createShareLink } from "./share";
 import { DEFAULT_MARKDOWN, MARKDOWN_LINK } from "./markdown";
 import MarkdownCard from "./MarkdownCard";
+import { TABLE_LINK, createDefaultTable } from "./tableData";
+import TableCard from "./TableCard";
 import TextStylePanel from "./TextStylePanel";
 import {
   getNativeMarkdownEnabled,
@@ -372,11 +374,10 @@ function BoardCanvas({ id }) {
     (elementId, nextMarkdown) => {
       if (!api || readOnlyRef.current) return;
       const elements = api.getSceneElementsIncludingDeleted();
-      let changed = false;
+      let updatedCard = null;
       const nextElements = elements.map((el) => {
         if (el.id !== elementId) return el;
-        changed = true;
-        return {
+        updatedCard = {
           ...el,
           version: (el.version || 0) + 1,
           versionNonce: Math.floor(Math.random() * 2147483647),
@@ -387,35 +388,148 @@ function BoardCanvas({ id }) {
             markdown: nextMarkdown,
           },
         };
+        return updatedCard;
       });
-      if (changed) {
-        api.updateScene({ elements: nextElements });
+      if (updatedCard) {
+        const curAppState = api.getAppState();
+        const keepActive =
+          curAppState.activeEmbeddable?.element?.id === elementId &&
+          curAppState.activeEmbeddable?.state === "active";
+        api.updateScene({
+          elements: nextElements,
+          ...(keepActive
+            ? {
+                appState: {
+                  activeEmbeddable: { element: updatedCard, state: "active" },
+                },
+              }
+            : {}),
+        });
       }
     },
     [api]
   );
 
-  // Alt+M shortcut to insert a Markdown card
+  const handleInsertTableCard = useCallback(() => {
+    if (!api || readOnlyRef.current) return;
+    const appState = api.getAppState();
+    const zoom = appState.zoom?.value || 1;
+    const cardW = 480;
+    const cardH = 240;
+    const centerX = -appState.scrollX + appState.width / (2 * zoom);
+    const centerY = -appState.scrollY + appState.height / (2 * zoom);
+
+    const [card] = restoreElements(
+      [
+        {
+          type: "embeddable",
+          id: `tbl_${newId()}`,
+          x: Math.round(centerX - cardW / 2),
+          y: Math.round(centerY - cardH / 2),
+          width: cardW,
+          height: cardH,
+          link: TABLE_LINK,
+          strokeColor: appState.theme === "dark" ? "#4a4a5a" : "#d0d0dc",
+          backgroundColor: "transparent",
+          strokeWidth: 1,
+          roughness: 0,
+          roundness: { type: 3, value: 10 },
+          customData: {
+            type: "table",
+            table: createDefaultTable(langCode === "zh-CN"),
+          },
+        },
+      ],
+      null
+    );
+
+    const current = api.getSceneElementsIncludingDeleted();
+    api.updateScene({
+      elements: [...current, card],
+      appState: {
+        selectedElementIds: { [card.id]: true },
+        activeEmbeddable: { element: card, state: "active" },
+      },
+    });
+  }, [api, langCode]);
+
+  const handleUpdateTable = useCallback(
+    (elementId, nextTable) => {
+      if (!api || readOnlyRef.current) return;
+      const elements = api.getSceneElementsIncludingDeleted();
+      let updatedCard = null;
+      const nextElements = elements.map((el) => {
+        if (el.id !== elementId) return el;
+        const prevRowCount = el.customData?.table?.rows?.length || 0;
+        const nextRowCount = nextTable?.rows?.length || 0;
+        const neededH = Math.min(720, nextRowCount * 40 + 82);
+        const nextHeight =
+          nextRowCount > prevRowCount
+            ? Math.max(el.height || 240, neededH)
+            : el.height;
+        updatedCard = {
+          ...el,
+          height: nextHeight,
+          version: (el.version || 0) + 1,
+          versionNonce: Math.floor(Math.random() * 2147483647),
+          updated: Date.now(),
+          customData: {
+            ...(el.customData || {}),
+            type: "table",
+            table: nextTable,
+          },
+        };
+        return updatedCard;
+      });
+      if (updatedCard) {
+        const curAppState = api.getAppState();
+        const keepActive =
+          curAppState.activeEmbeddable?.element?.id === elementId &&
+          curAppState.activeEmbeddable?.state === "active";
+        api.updateScene({
+          elements: nextElements,
+          ...(keepActive
+            ? {
+                appState: {
+                  activeEmbeddable: { element: updatedCard, state: "active" },
+                },
+              }
+            : {}),
+        });
+      }
+    },
+    [api]
+  );
+
+  // Alt+M shortcut to insert a Markdown card, Alt+T to insert a Table card
   useEffect(() => {
     const onKeyDown = (e) => {
       if (
         e.altKey &&
         !e.ctrlKey &&
         !e.metaKey &&
-        e.key.toLowerCase() === "m" &&
         document.activeElement?.tagName !== "INPUT" &&
         document.activeElement?.tagName !== "TEXTAREA"
       ) {
-        e.preventDefault();
-        handleInsertMarkdownCard();
+        const key = e.key.toLowerCase();
+        if (key === "m") {
+          e.preventDefault();
+          handleInsertMarkdownCard();
+        } else if (key === "t") {
+          e.preventDefault();
+          handleInsertTableCard();
+        }
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [handleInsertMarkdownCard]);
+  }, [handleInsertMarkdownCard, handleInsertTableCard]);
 
   const validateEmbeddable = useCallback((link) => {
-    if (typeof link === "string" && link.startsWith("markdown://")) {
+    if (
+      typeof link === "string" &&
+      (link.startsWith("markdown://") || link.startsWith("table://"))
+    ) {
       return true;
     }
     return undefined;
@@ -423,13 +537,13 @@ function BoardCanvas({ id }) {
 
   const renderEmbeddable = useCallback(
     (element, appState) => {
+      const isActive =
+        appState.activeEmbeddable?.element?.id === element.id &&
+        appState.activeEmbeddable?.state === "active";
       if (
         element.customData?.type === "markdown" ||
         element.link?.startsWith("markdown://")
       ) {
-        const isActive =
-          appState.activeEmbeddable?.element?.id === element.id &&
-          appState.activeEmbeddable?.state === "active";
         return (
           <MarkdownCard
             element={element}
@@ -440,9 +554,24 @@ function BoardCanvas({ id }) {
           />
         );
       }
+      if (
+        element.customData?.type === "table" ||
+        element.link?.startsWith("table://")
+      ) {
+        return (
+          <TableCard
+            element={element}
+            theme={appState.theme}
+            isActive={isActive}
+            readOnly={readOnly}
+            langCode={langCode}
+            onUpdate={handleUpdateTable}
+          />
+        );
+      }
       return null;
     },
-    [readOnly, handleUpdateMarkdown]
+    [readOnly, langCode, handleUpdateMarkdown, handleUpdateTable]
   );
 
   const handleTitleBlur = async () => {
@@ -562,6 +691,13 @@ function BoardCanvas({ id }) {
                 >
                   +MD
                 </button>
+                <button
+                  className="btn small tbl-insert-btn"
+                  title={isZh ? "插入交互表格 (Alt+T)" : "Insert interactive table (Alt+T)"}
+                  onClick={handleInsertTableCard}
+                >
+                  {isZh ? "+表格" : "+Table"}
+                </button>
               </>
             )}
             <button
@@ -626,6 +762,9 @@ function BoardCanvas({ id }) {
               </MainMenu.Item>
               <MainMenu.Item onSelect={handleInsertMarkdownCard}>
                 {isZh ? "插入 Markdown 卡片 (Alt+M)" : "Insert Markdown card (Alt+M)"}
+              </MainMenu.Item>
+              <MainMenu.Item onSelect={handleInsertTableCard}>
+                {isZh ? "插入交互表格 (Alt+T)" : "Insert interactive table (Alt+T)"}
               </MainMenu.Item>
             </>
           )}

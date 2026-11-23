@@ -10,6 +10,7 @@ import { loadSharedBoard } from "./share";
 import { createBoardWithData, stripAppState } from "./storage";
 import { scheduleAutoSync } from "./webdav";
 import MarkdownCard from "./MarkdownCard";
+import TableCard from "./TableCard";
 
 const LANG_KEY = "excalidraw-multi:lang";
 
@@ -79,29 +80,50 @@ export default function ShareView() {
   }, [state.data]);
 
   const validateEmbeddable = useCallback((link) => {
-    if (typeof link === "string" && link.startsWith("markdown://")) {
+    if (
+      typeof link === "string" &&
+      (link.startsWith("markdown://") || link.startsWith("table://"))
+    ) {
       return true;
     }
     return undefined;
   }, []);
 
-  const renderEmbeddable = useCallback((element, appState) => {
-    if (
-      element.customData?.type === "markdown" ||
-      element.link?.startsWith("markdown://")
-    ) {
-      return (
-        <MarkdownCard
-          element={element}
-          theme={appState.theme}
-          isActive={false}
-          readOnly={true}
-          onUpdate={() => {}}
-        />
-      );
-    }
-    return null;
-  }, []);
+  const renderEmbeddable = useCallback(
+    (element, appState) => {
+      if (
+        element.customData?.type === "markdown" ||
+        element.link?.startsWith("markdown://")
+      ) {
+        return (
+          <MarkdownCard
+            element={element}
+            theme={appState.theme}
+            isActive={false}
+            readOnly={true}
+            onUpdate={() => {}}
+          />
+        );
+      }
+      if (
+        element.customData?.type === "table" ||
+        element.link?.startsWith("table://")
+      ) {
+        return (
+          <TableCard
+            element={element}
+            theme={appState.theme}
+            isActive={false}
+            readOnly={true}
+            langCode={langCode}
+            onUpdate={() => {}}
+          />
+        );
+      }
+      return null;
+    },
+    [langCode]
+  );
 
   const handleCopyToMyBoards = useCallback(async () => {
     if (!state.data || copying) return;
