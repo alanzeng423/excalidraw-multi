@@ -177,6 +177,17 @@ function excalidrawCustomFontsPlugin() {
       `n("Virgil",...$1),n(Mn,...${lxgwList})${initRegistrations}`
     );
 
+    // 4b. Independent CJK font stack resolution for ea() and Ee()
+    const eaEePattern =
+      /ea=\(\{fontFamily:e\}\)=>\{for\(let\[t,n\]of Object\.entries\(Ie\)\)if\(n===e\)return`\$\{t\}\$\{bo\(n\)\.map\(r=>`, \$\{r\}`\)\.join\(""\)\}`;return Tn\},Ee=\(\{fontSize:e,fontFamily:t\}\)=>`\$\{e\}px \$\{ea\(\{fontFamily:t\}\)\}`/;
+    if (!eaEePattern.test(out)) {
+      throw new Error("Could not find Excalidraw ea/Ee font string helpers to patch");
+    }
+    out = out.replace(
+      eaEePattern,
+      `ea=(_arg)=>{const e=_arg?.fontFamily;const _cjk=globalThis.__EXCALIDRAW_CJK__?.resolveFamily(_arg?.customData?.cjkFont,_arg?.id);for(let[t,n]of Object.entries(Ie))if(n===e)return _cjk?\`\${t}, \${_cjk}, \${Tn}\`:\`\${t}\${bo(n).map(r=>\`, \${r}\`).join("")}\`;return _cjk?\`\${_cjk}, \${Tn}\`:Tn},Ee=(_arg)=>\`\${_arg?.fontSize}px \${ea(_arg)}\``
+    );
+
     // 5. Native Markdown hooks for Excalidraw text measurement, Canvas draw, cache, and SVG export
     const enPattern = /En=\(e,t\)=>\(Ao\|\|\(Ao=new oa\),Ao\.getLineWidth\(e,t\)\)/;
     if (!enPattern.test(out)) {
@@ -212,7 +223,7 @@ function excalidrawCustomFontsPlugin() {
     }
     out = out.replace(
       cachePattern,
-      `const _mdOn=Boolean(globalThis.__EXCALIDRAW_MD__?.enabled);if(!i||a||i.theme!==r.theme||i.mdEnabled!==_mdOn||i.boundTextElementVersion!==d||i.imageCrop!==c||i.containingFrameOpacity!==l||ee(e)&&s&&e.angle!==i.angle){let U=K1(e,t,o,n,r);return U?(U.mdEnabled=_mdOn,Jo.set(e,U),U):null}`
+      `const _mdOn=Boolean(globalThis.__EXCALIDRAW_MD__?.enabled);const _cjkEp=globalThis.__EXCALIDRAW_CJK__?.epoch||0;if(!i||a||i.theme!==r.theme||i.mdEnabled!==_mdOn||i.cjkEpoch!==_cjkEp||i.boundTextElementVersion!==d||i.imageCrop!==c||i.containingFrameOpacity!==l||ee(e)&&s&&e.angle!==i.angle){let U=K1(e,t,o,n,r);return U?(U.mdEnabled=_mdOn,U.cjkEpoch=_cjkEp,Jo.set(e,U),U):null}`
     );
 
     const svgTextPattern =

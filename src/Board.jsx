@@ -29,6 +29,13 @@ import { TABLE_LINK, createDefaultTable } from "./tableData";
 import TableCard from "./TableCard";
 import TextStylePanel from "./TextStylePanel";
 import {
+  getDefaultCjkFontId,
+  getElementFontFamilyStr,
+  markLegacyTextIds,
+  onCjkFontLoaded,
+  preloadSceneCjkFonts,
+} from "./cjkFonts";
+import {
   getNativeMarkdownEnabled,
   measureNativeTextBox,
   setNativeMarkdownEnabled,
@@ -51,22 +58,6 @@ const SHARE_TTL_OPTIONS = [
   { value: 7776000, zh: "90 天", en: "90 days" },
   { value: 0, zh: "永久", en: "Never" },
 ];
-
-const FONT_FAMILY_NAMES = {
-  1: "Virgil, Segoe UI Emoji",
-  2: "Helvetica, Segoe UI Emoji",
-  3: "Cascadia, Segoe UI Emoji",
-  5: "Excalifont, Xiaolai, Segoe UI Emoji",
-  6: "Nunito, Segoe UI Emoji",
-  7: "Lilita One, Segoe UI Emoji",
-  8: "Comic Shanns, Segoe UI Emoji",
-  9: "Liberation Sans, Segoe UI Emoji",
-  10: "Shantell Sans, Xiaolai, Segoe UI Emoji",
-  11: "Google Sans, Xiaolai, Segoe UI Emoji",
-  12: "Open Sans, Xiaolai, Segoe UI Emoji",
-  13: "Playwrite AR Guides, Xiaolai, Segoe UI Emoji",
-  14: "Bentham, Xiaolai, Segoe UI Emoji",
-};
 
 const SAVE_DEBOUNCE_MS = 600;
 
@@ -93,6 +84,7 @@ function BoardCanvas({ id }) {
   const pendingRef = useRef(null);
   const versionHashRef = useRef(-1);
   const fileIdsRef = useRef(new Set());
+  const knownTextIdsRef = useRef(new Set());
   const fileInputRef = useRef(null);
 
   const libraryAdapter = useMemo(
@@ -129,13 +121,19 @@ function BoardCanvas({ id }) {
         setTitle(meta.title);
         document.title = `${meta.title} · Excalidraw`;
         const { scene, files } = await loadBoard(id);
+        const initialElements = scene?.elements || [];
+        markLegacyTextIds(initialElements);
+        knownTextIdsRef.current = new Set(
+          initialElements.filter((el) => el?.type === "text").map((el) => el.id)
+        );
+        preloadSceneCjkFonts(initialElements);
         fileIdsRef.current = new Set(Object.keys(files));
-        versionHashRef.current = hashElements(scene?.elements || []);
+        versionHashRef.current = hashElements(initialElements);
         setTimeout(() => {
           readyRef.current = true;
         }, 0);
         return {
-          elements: scene?.elements || [],
+          elements: initialElements,
           appState: { ...(scene?.appState || {}), collaborators: new Map() },
           files,
           scrollToContent: !scene?.appState,
@@ -180,9 +178,53 @@ function BoardCanvas({ id }) {
     if (pending.touch) scheduleAutoSync(4000);
   }, [id]);
 
+  useEffect(() => {
+    if (!api) return;
+    return onCjkFontLoaded(() => {
+      api.refresh?.();
+    });
+  }, [api]);
+
   const handleChange = useCallback(
     (elements, appState, files) => {
       if (!readyRef.current || readOnlyRef.current) return;
+
+      // Stamp the active default Chinese font onto newly created text elements
+      // once the user finishes typing, so changing the default later won't alter them.
+      if (!appState?.editingTextElement && api) {
+        const unstampedIds = [];
+        for (const el of elements) {
+          if (
+            el &&
+            !el.isDeleted &&
+            el.type === "text" &&
+            !knownTextIdsRef.current.has(el.id)
+          ) {
+            knownTextIdsRef.current.add(el.id);
+            if (!el.customData?.cjkFont) {
+              unstampedIds.push(el.id);
+            }
+          }
+        }
+        if (unstampedIds.length > 0) {
+          const stampFont = getDefaultCjkFontId();
+          const idSet = new Set(unstampedIds);
+          const stamped = api
+            .getSceneElementsIncludingDeleted()
+            .map((el) =>
+              idSet.has(el.id)
+                ? {
+                    ...el,
+                    customData: { ...(el.customData || {}), cjkFont: stampFont },
+                  }
+                : el
+            );
+          queueMicrotask(() => {
+            api.updateScene({ elements: stamped });
+          });
+        }
+      }
+
       const hash = hashElements(elements);
       const elementsChanged = hash !== versionHashRef.current;
       versionHashRef.current = hash;
@@ -208,7 +250,7 @@ function BoardCanvas({ id }) {
       clearTimeout(timerRef.current);
       timerRef.current = setTimeout(flushSave, SAVE_DEBOUNCE_MS);
     },
-    [flushSave]
+    [api, flushSave]
   );
 
   useEffect(() => {
@@ -279,8 +321,7 @@ function BoardCanvas({ id }) {
     const nextElements = elements.map((el) => {
       if (el.isDeleted) return el;
       if (el.type === "text") {
-        const fontFamilyStr =
-          FONT_FAMILY_NAMES[el.fontFamily] || FONT_FAMILY_NAMES[5];
+        const fontFamilyStr = getElementFontFamilyStr(el);
         const measured = measureNativeTextBox(
           el.text,
           el.fontSize || 20,

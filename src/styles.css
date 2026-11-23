@@ -1512,10 +1512,196 @@ body {
 
 /* ===== Excalidraw Left Panel Rich-Text / Markdown Controls ===== */
 
-.md-style-panel-host {
+.md-style-panel-host,
+.md-cjk-panel-host {
   display: block;
   width: 100%;
   min-width: 0;
+}
+
+.md-cjk-subnote {
+  font-size: 10px;
+  color: var(--color-gray-50, #8a8a99);
+}
+
+.md-cjk-quick-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 3px;
+  width: 100%;
+}
+
+.md-cjk-pill {
+  min-width: 0;
+  height: 26px;
+  padding: 0 2px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: var(--color-surface-low, #f4f4f8);
+  color: var(--color-on-surface, #1b1b1f);
+  font-family: var(--ui-font, var(--font-ui));
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.md-cjk-pill:hover {
+  background: var(--color-surface-high, #e9e9f2);
+}
+
+.md-cjk-pill.active {
+  background: var(--color-primary-light, #e0dfff);
+  color: var(--color-primary-darkest, #443fc4);
+  border-color: var(--color-primary, #6965db);
+}
+
+.excalidraw.theme--dark .md-cjk-pill {
+  background: #2e2d39;
+  color: #e3e3e8;
+}
+
+.excalidraw.theme--dark .md-cjk-pill:hover {
+  background: #3a3948;
+}
+
+.excalidraw.theme--dark .md-cjk-pill.active {
+  background: #403e6a;
+  color: #e0dfff;
+  border-color: #a8a5ff;
+}
+
+.md-cjk-trigger {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--default-border-color, #dcdce8);
+  background: var(--island-bg-color, #ffffff);
+  color: var(--color-on-surface, #1b1b1f);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.md-cjk-trigger:hover,
+.md-cjk-trigger.open {
+  border-color: var(--color-primary, #6965db);
+}
+
+.excalidraw.theme--dark .md-cjk-trigger {
+  background: #282832;
+  border-color: #3d3d4d;
+  color: #e6e6ee;
+}
+
+.excalidraw.theme--dark .md-cjk-trigger:hover,
+.excalidraw.theme--dark .md-cjk-trigger.open {
+  border-color: #a8a5ff;
+}
+
+.md-cjk-trigger-name {
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-cjk-trigger-meta {
+  font-size: 10.5px;
+  color: var(--color-gray-50, #8a8a99);
+  flex-shrink: 0;
+}
+
+.md-cjk-list {
+  width: 100%;
+  max-height: 215px;
+  overflow-y: auto;
+  border-radius: 7px;
+  border: 1px solid var(--default-border-color, #dcdce8);
+  background: var(--island-bg-color, #ffffff);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.excalidraw.theme--dark .md-cjk-list {
+  background: #23232c;
+  border-color: #3a3a4a;
+}
+
+.md-cjk-group-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--color-gray-50, #8a8a99);
+  padding: 4px 6px 2px;
+  letter-spacing: 0.02em;
+}
+
+.md-cjk-option {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 6px;
+  border-radius: 5px;
+  border: none;
+  background: transparent;
+  color: var(--color-on-surface, #1b1b1f);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+
+.md-cjk-option:hover {
+  background: var(--color-surface-low, #f2f2fa);
+}
+
+.md-cjk-option.active {
+  background: var(--color-primary-light, #e5e4ff);
+  color: var(--color-primary-darkest, #443fc4);
+}
+
+.excalidraw.theme--dark .md-cjk-option {
+  color: #e4e4ec;
+}
+
+.excalidraw.theme--dark .md-cjk-option:hover {
+  background: #302f3e;
+}
+
+.excalidraw.theme--dark .md-cjk-option.active {
+  background: #3f3d68;
+  color: #e4e3ff;
+}
+
+.md-cjk-opt-name {
+  font-size: 13px;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-cjk-opt-tag {
+  font-size: 10px;
+  color: var(--color-gray-50, #8a8a99);
+  flex-shrink: 0;
+}
+
+.md-cjk-option.active .md-cjk-opt-tag {
+  color: inherit;
+  opacity: 0.8;
 }
 
 .md-style-panel {

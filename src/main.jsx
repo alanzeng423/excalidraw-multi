@@ -1,6 +1,7 @@
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import "@excalidraw/excalidraw/index.css";
+import { initCjkFonts } from "./cjkFonts";
 import { initNativeMarkdown } from "./nativeMarkdown";
 import { initTableRenderer } from "./tableRender";
 import Home from "./Home";
@@ -8,6 +9,7 @@ import Board from "./Board";
 import ShareView from "./ShareView";
 import "./styles.css";
 
+initCjkFonts();
 initNativeMarkdown();
 initTableRenderer();
 

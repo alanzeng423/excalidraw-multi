@@ -11,6 +11,11 @@ import { createBoardWithData, stripAppState } from "./storage";
 import { scheduleAutoSync } from "./webdav";
 import MarkdownCard from "./MarkdownCard";
 import TableCard from "./TableCard";
+import {
+  markLegacyTextIds,
+  onCjkFontLoaded,
+  preloadSceneCjkFonts,
+} from "./cjkFonts";
 
 const LANG_KEY = "excalidraw-multi:lang";
 
@@ -37,6 +42,8 @@ export default function ShareView() {
     loadSharedBoard(id, window.location.hash)
       .then((data) => {
         if (cancelled) return;
+        markLegacyTextIds(data.elements);
+        preloadSceneCjkFonts(data.elements);
         document.title = `${data.title} · Shared · Excalidraw`;
         setState({ status: "ready", data, error: "" });
       })
@@ -53,6 +60,13 @@ export default function ShareView() {
       cancelled = true;
     };
   }, [id]);
+
+  useEffect(() => {
+    if (!api) return;
+    return onCjkFontLoaded(() => {
+      api.refresh?.();
+    });
+  }, [api]);
 
   const toggleLang = useCallback(() => {
     setLangCode((prev) => {
