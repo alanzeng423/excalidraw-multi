@@ -456,7 +456,7 @@ function BoardCanvas({ id }) {
     const appState = api.getAppState();
     const zoom = appState.zoom?.value || 1;
     const cardW = 480;
-    const cardH = 240;
+    const cardH = 188;
     const centerX = -appState.scrollX + appState.width / (2 * zoom);
     const centerY = -appState.scrollY + appState.height / (2 * zoom);
 
@@ -470,13 +470,15 @@ function BoardCanvas({ id }) {
           width: cardW,
           height: cardH,
           link: TABLE_LINK,
-          strokeColor: appState.theme === "dark" ? "#4a4a5a" : "#d0d0dc",
+          strokeColor: appState.currentItemStrokeColor || "#1e1e1e",
           backgroundColor: "transparent",
-          strokeWidth: 1,
-          roughness: 0,
-          roundness: { type: 3, value: 10 },
+          strokeWidth: 1.5,
+          roughness: 1,
+          roundness: { type: 3, value: 8 },
+          fontFamily: appState.currentItemFontFamily || 5,
           customData: {
             type: "table",
+            cjkFont: getDefaultCjkFontId(),
             table: createDefaultTable(langCode === "zh-CN"),
           },
         },
@@ -503,13 +505,23 @@ function BoardCanvas({ id }) {
         if (el.id !== elementId) return el;
         const prevRowCount = el.customData?.table?.rows?.length || 0;
         const nextRowCount = nextTable?.rows?.length || 0;
-        const neededH = Math.min(720, nextRowCount * 40 + 82);
+        const prevColCount = el.customData?.table?.colWidths?.length || 0;
+        const nextColCount = nextTable?.colWidths?.length || 0;
+        const neededH = Math.min(760, nextRowCount * 52 + 44);
         const nextHeight =
           nextRowCount > prevRowCount
-            ? Math.max(el.height || 240, neededH)
+            ? Math.min(
+                760,
+                Math.max((el.height || 188) + 46 * (nextRowCount - prevRowCount), neededH)
+              )
             : el.height;
+        const nextWidth =
+          nextColCount > prevColCount
+            ? Math.min(1100, (el.width || 480) + 115 * (nextColCount - prevColCount))
+            : el.width;
         updatedCard = {
           ...el,
+          width: nextWidth,
           height: nextHeight,
           version: (el.version || 0) + 1,
           versionNonce: Math.floor(Math.random() * 2147483647),
@@ -839,6 +851,7 @@ function BoardCanvas({ id }) {
         nativeMd={nativeMd}
         onToggleNativeMd={handleToggleNativeMd}
         onEnsureNativeMd={handleEnsureNativeMd}
+        onUpdateTable={handleUpdateTable}
         readOnly={readOnly}
       />
 

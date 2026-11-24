@@ -1,16 +1,264 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import rough from "roughjs";
+import { getElementFontFamilyStr } from "./cjkFonts";
+import { parseMarkdownLine } from "./nativeMarkdown";
 import {
-  TABLE_CELL_BG_PALETTE,
-  TABLE_CELL_TEXT_PALETTE,
+  applyInlineFormat,
+  applyInlineHighlight,
+} from "./textFormatting";
+import {
+  canMergeRange,
+  canSplitRange,
   createEmptyCell,
+  expandSelectionForMerges,
+  getCellAnchor,
+  insertColAt,
+  insertRowAt,
+  mergeCells,
   normalizeTableData,
   parseTabularPaste,
   resolveCellBg,
   resolveCellTextColor,
-  tableToMarkdown,
+  setTableSelection,
+  splitCells,
 } from "./tableData";
 
-const ALIGN_ORDER = ["left", "center", "right"];
+function toggleCellTaskAtLine(rawText, lineIdx) {
+  const lines = String(rawText ?? "").replace(/\r\n?/g, "\n").split("\n");
+  if (lineIdx < 0 || lineIdx >= lines.length) return rawText;
+  lines[lineIdx] = lines[lineIdx].replace(
+    /^(\s*[-*+]\s+\[)([ xX])(\]\s+)/,
+    (_, pre, mark, post) => `${pre}${mark === " " ? "x" : " "}${post}`
+  );
+  return lines.join("\n");
+}
+
+function CellMarkdown({ text, readOnly, onToggleTask }) {
+  const raw = String(text ?? "");
+  if (!raw) return <div className="tbl-cell-view">&nbsp;</div>;
+  const lines = raw.replace(/\r\n?/g, "\n").split("\n");
+
+  return (
+    <div className="tbl-cell-view">
+      {lines.map((rawLine, li) => {
+        const parsed = parseMarkdownLine(rawLine);
+        const cls = [
+          "tbl-md-line",
+          parsed.kind === "heading" ? `tbl-md-h${parsed.level}` : "",
+          parsed.prefixType === "quote" ? "tbl-md-quote" : "",
+          parsed.prefixType === "bullet" ? "tbl-md-bullet" : "",
+          parsed.prefixType === "task-checked" || parsed.prefixType === "task-unchecked"
+            ? "tbl-md-task"
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+        return (
+          <div
+            key={li}
+            className={cls}
+            style={
+              parsed.indent
+                ? { paddingLeft: `${parsed.indent * 12}px` }
+                : undefined
+            }
+          >
+            {parsed.prefixType === "bullet" && (
+              <span className="tbl-md-bullet-dot" aria-hidden="true">•</span>
+            )}
+            {(parsed.prefixType === "task-unchecked" ||
+              parsed.prefixType === "task-checked") && (
+              <input
+                type="checkbox"
+                className="tbl-md-checkbox"
+                checked={parsed.prefixType === "task-checked"}
+                readOnly={readOnly}
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!readOnly) onToggleTask?.(li);
+                }}
+                onChange={() => {}}
+              />
+            )}
+            <span className="tbl-md-spans">
+              {parsed.spans.length === 0 ? (
+                "\u00A0"
+              ) : (
+                parsed.spans.map((span, si) => {
+                  const style = {};
+                  if (span.color) style.color = span.color;
+                  if (span.highlight) style.backgroundColor = span.highlight;
+                  const sCls = [
+                    span.bold && !span.code ? "tbl-s-bold" : "",
+                    span.italic && !span.code ? "tbl-s-italic" : "",
+                    span.strike ? "tbl-s-strike" : "",
+                    span.code ? "tbl-s-code" : "",
+                    span.highlight ? "tbl-s-hl" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ");
+                  return (
+                    <span key={si} className={sCls || undefined} style={style}>
+                      {span.text}
+                    </span>
+                  );
+                })
+              )}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Draws internal table gridlines matching Excalidraw's native stroke style & roughness
+ * (using roughjs when roughness > 0) while automatically skipping borders inside merged cells.
+ */
+function NativeGridOverlay({
+  table,
+  tableElRef,
+  element,
+  isDark,
+  layoutTick,
+}) {
+  const svgRef = useRef(null);
+
+  useLayoutEffect(() => {
+    const svg = svgRef.current;
+    const tbl = tableElRef.current;
+    if (!svg || !tbl) return;
+
+    const w = tbl.offsetWidth;
+    const h = tbl.offsetHeight;
+    if (!w || !h) return;
+
+    svg.setAttribute("width", String(w));
+    svg.setAttribute("height", String(h));
+    svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    svg.replaceChildren();
+
+    const R = table.rows.length;
+    const C = table.colWidths.length;
+
+    // Measure actual row Y coordinates & column X coordinates from the live table DOM
+    const trEls = tbl.querySelectorAll(":scope > tbody > tr");
+    const rowY = [0];
+    for (let r = 0; r < trEls.length; r += 1) {
+      rowY.push(trEls[r].offsetTop + trEls[r].offsetHeight);
+    }
+    while (rowY.length <= R) rowY.push(h);
+
+    const totalWeight = table.colWidths.reduce((s, v) => s + v, 0) || 1;
+    const colX = [0];
+    let acc = 0;
+    for (let c = 0; c < C; c += 1) {
+      acc += (table.colWidths[c] / totalWeight) * w;
+      colX.push(acc);
+    }
+
+    const rawStroke =
+      element.strokeColor && element.strokeColor !== "transparent"
+        ? element.strokeColor
+        : "#1e1e1e";
+    const strokeColor =
+      isDark && (rawStroke === "#1e1e1e" || rawStroke === "#000000")
+        ? "#d4d4e0"
+        : rawStroke;
+    const baseWidth = Math.max(1, Math.min(3.5, (element.strokeWidth || 1.5) * 0.72));
+    const roughness = Number.isFinite(element.roughness) ? element.roughness : 1;
+    const strokeDash =
+      element.strokeStyle === "dashed"
+        ? [8, 6]
+        : element.strokeStyle === "dotted"
+          ? [2, 5]
+          : undefined;
+
+    const rc = roughness > 0 ? rough.svg(svg) : null;
+    const seed = (element.seed || 1) + 73;
+
+    const drawSegment = (x1, y1, x2, y2, emphasized = false) => {
+      const sw = emphasized ? Math.max(1.5, baseWidth * 1.25) : baseWidth;
+      if (rc) {
+        const node = rc.line(x1, y1, x2, y2, {
+          stroke: strokeColor,
+          strokeWidth: sw,
+          roughness: roughness * 0.72,
+          bowing: 0.7,
+          seed,
+          strokeLineDash: strokeDash,
+          disableMultiStroke: true,
+        });
+        svg.appendChild(node);
+      } else {
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", String(x1));
+        line.setAttribute("y1", String(y1));
+        line.setAttribute("x2", String(x2));
+        line.setAttribute("y2", String(y2));
+        line.setAttribute("stroke", strokeColor);
+        line.setAttribute("stroke-width", String(sw));
+        line.setAttribute("stroke-opacity", emphasized ? "0.9" : "0.72");
+        if (strokeDash) line.setAttribute("stroke-dasharray", strokeDash.join(" "));
+        svg.appendChild(line);
+      }
+    };
+
+    const sameAnchor = (r1, c1, r2, c2) => {
+      const a1 = getCellAnchor(table, r1, c1);
+      const a2 = getCellAnchor(table, r2, c2);
+      return a1.r === a2.r && a1.c === a2.c;
+    };
+
+    // Horizontal internal boundaries (between row r-1 and row r), coalesced into contiguous segments
+    for (let r = 1; r < R; r += 1) {
+      const y = rowY[r];
+      const isHeaderEdge = table.headerRow && r === 1;
+      let segStart = null;
+      for (let c = 0; c <= C; c += 1) {
+        const needBorder = c < C && !sameAnchor(r - 1, c, r, c);
+        if (needBorder && segStart === null) {
+          segStart = colX[c];
+        } else if (!needBorder && segStart !== null) {
+          drawSegment(segStart, y, colX[c], y, isHeaderEdge);
+          segStart = null;
+        }
+      }
+    }
+
+    // Vertical internal boundaries (between col c-1 and col c), coalesced into contiguous segments
+    for (let c = 1; c < C; c += 1) {
+      const x = colX[c];
+      let segStart = null;
+      for (let r = 0; r <= R; r += 1) {
+        const needBorder = r < R && !sameAnchor(r, c - 1, r, c);
+        if (needBorder && segStart === null) {
+          segStart = rowY[r];
+        } else if (!needBorder && segStart !== null) {
+          drawSegment(x, segStart, x, rowY[r], false);
+          segStart = null;
+        }
+      }
+    }
+  }, [
+    table,
+    tableElRef,
+    element.width,
+    element.height,
+    element.strokeColor,
+    element.strokeWidth,
+    element.strokeStyle,
+    element.roughness,
+    element.seed,
+    isDark,
+    layoutTick,
+  ]);
+
+  return <svg ref={svgRef} className="table-grid-svg" aria-hidden="true" />;
+}
 
 export default function TableCard({
   element,
@@ -28,43 +276,84 @@ export default function TableCard({
     [element.customData?.table]
   );
 
-  const [focus, setFocus] = useState(null); // { r, c } | null
-  const [openPicker, setOpenPicker] = useState(null); // "bg" | "color" | null
-  const [copiedMd, setCopiedMd] = useState(false);
+  // Selection range { r1, c1, r2, c2 } and editing cell { r, c }
+  const [range, setRange] = useState(null);
+  const [editingCell, setEditingCell] = useState(null);
   const [resizingWidths, setResizingWidths] = useState(null);
+  const [layoutTick, setLayoutTick] = useState(0);
 
   const tableWrapRef = useRef(null);
+  const tableElRef = useRef(null);
   const editorRef = useRef(null);
+  const dragOriginRef = useRef(null);
+  const draggingRef = useRef(false);
   const resizeStateRef = useRef(null);
 
-  // Clear focus & pickers when leaving active edit mode or read-only
+  const expandedRange = useMemo(
+    () => (range ? expandSelectionForMerges(table, range) : null),
+    [table, range]
+  );
+
+  // Publish selection to shared store so Left Style Panel controls act on this table's selection
+  useEffect(() => {
+    if (isActive && !readOnly) {
+      setTableSelection({
+        elementId: element.id,
+        range: expandedRange,
+        editingCell,
+      });
+    }
+  }, [isActive, readOnly, element.id, expandedRange, editingCell]);
+
+  // Clear local editing when deactivated or read-only
   useEffect(() => {
     if (!isActive || readOnly) {
-      setFocus(null);
-      setOpenPicker(null);
+      setEditingCell(null);
+      setRange(null);
+      draggingRef.current = false;
+      dragOriginRef.current = null;
     }
   }, [isActive, readOnly]);
 
-  // Clamp focus if rows/cols shrink externally (e.g. Undo)
+  // Clamp selection if table shrinks
   useEffect(() => {
-    if (!focus) return;
     const maxR = table.rows.length - 1;
     const maxC = table.colWidths.length - 1;
-    if (focus.r > maxR || focus.c > maxC) {
-      setFocus({ r: Math.min(focus.r, maxR), c: Math.min(focus.c, maxC) });
+    if (editingCell && (editingCell.r > maxR || editingCell.c > maxC)) {
+      setEditingCell(null);
     }
-  }, [focus, table.rows.length, table.colWidths.length]);
+    if (
+      range &&
+      (range.r1 > maxR || range.r2 > maxR || range.c1 > maxC || range.c2 > maxC)
+    ) {
+      setRange({
+        r1: Math.min(range.r1, maxR),
+        c1: Math.min(range.c1, maxC),
+        r2: Math.min(range.r2, maxR),
+        c2: Math.min(range.c2, maxC),
+      });
+    }
+  }, [table.rows.length, table.colWidths.length, editingCell, range]);
 
-  // Focus & auto-size textarea whenever focused cell changes
+  // Observe table box resizing to redraw native SVG grid lines smoothly
+  useEffect(() => {
+    const tbl = tableElRef.current;
+    if (!tbl || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => setLayoutTick((n) => n + 1));
+    ro.observe(tbl);
+    return () => ro.disconnect();
+  }, []);
+
+  // Focus & auto-size textarea when entering cell edit mode
   useEffect(() => {
     const el = editorRef.current;
-    if (!el || !focus) return;
+    if (!el || !editingCell) return;
     el.focus();
     const len = el.value.length;
     el.setSelectionRange(len, len);
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
-  }, [focus?.r, focus?.c]);
+  }, [editingCell?.r, editingCell?.c]);
 
   const commit = useCallback(
     (nextTable) => {
@@ -86,111 +375,34 @@ export default function TableCard({
     [table, commit]
   );
 
-  const handleAddRow = useCallback(
-    (afterIdx) => {
-      const colCount = table.colWidths.length;
-      const insertAt =
-        typeof afterIdx === "number"
-          ? Math.min(table.rows.length, afterIdx + 1)
-          : table.rows.length;
-      const newRow = Array.from({ length: colCount }, () => createEmptyCell(""));
-      const nextRows = [
-        ...table.rows.slice(0, insertAt),
-        newRow,
-        ...table.rows.slice(insertAt),
-      ];
-      commit({ ...table, rows: nextRows });
-      setFocus({ r: insertAt, c: focus ? Math.min(focus.c, colCount - 1) : 0 });
-    },
-    [table, commit, focus]
-  );
+  const handleAppendRow = useCallback(() => {
+    const next = insertRowAt(table, table.rows.length);
+    const newR = next.rows.length - 1;
+    commit(next);
+    setRange({ r1: newR, c1: 0, r2: newR, c2: 0 });
+    setEditingCell({ r: newR, c: 0 });
+  }, [table, commit]);
 
-  const handleDeleteRow = useCallback(() => {
-    if (table.rows.length <= 1) return;
-    const targetR = focus ? focus.r : table.rows.length - 1;
-    const nextRows = table.rows.filter((_, ri) => ri !== targetR);
-    commit({ ...table, rows: nextRows });
-    setFocus({
-      r: Math.min(targetR, nextRows.length - 1),
-      c: focus ? focus.c : 0,
-    });
-  }, [table, commit, focus]);
-
-  const handleAddCol = useCallback(() => {
-    const insertAt = focus ? focus.c + 1 : table.colWidths.length;
-    const nextWidths = [
-      ...table.colWidths.slice(0, insertAt),
-      130,
-      ...table.colWidths.slice(insertAt),
-    ];
-    const nextAligns = [
-      ...table.colAligns.slice(0, insertAt),
-      "left",
-      ...table.colAligns.slice(insertAt),
-    ];
-    const nextRows = table.rows.map((row, ri) => [
-      ...row.slice(0, insertAt),
-      createEmptyCell(
-        table.headerRow && ri === 0
-          ? isZh
-            ? `列 ${insertAt + 1}`
-            : `Col ${insertAt + 1}`
-          : ""
-      ),
-      ...row.slice(insertAt),
-    ]);
-    commit({
-      ...table,
-      colWidths: nextWidths,
-      colAligns: nextAligns,
-      rows: nextRows,
-    });
-    setFocus({ r: focus ? focus.r : 0, c: insertAt });
-  }, [table, commit, focus, isZh]);
-
-  const handleDeleteCol = useCallback(() => {
-    if (table.colWidths.length <= 1) return;
-    const targetC = focus ? focus.c : table.colWidths.length - 1;
-    const nextWidths = table.colWidths.filter((_, ci) => ci !== targetC);
-    const nextAligns = table.colAligns.filter((_, ci) => ci !== targetC);
-    const nextRows = table.rows.map((row) =>
-      row.filter((_, ci) => ci !== targetC)
+  const handleAppendCol = useCallback(() => {
+    const newC = table.colWidths.length;
+    const next = insertColAt(
+      table,
+      newC,
+      isZh ? `列 ${newC + 1}` : `Col ${newC + 1}`
     );
-    commit({
-      ...table,
-      colWidths: nextWidths,
-      colAligns: nextAligns,
-      rows: nextRows,
-    });
-    setFocus({
-      r: focus ? focus.r : 0,
-      c: Math.min(targetC, nextWidths.length - 1),
-    });
-  }, [table, commit, focus]);
+    commit(next);
+    setRange({ r1: 0, c1: newC, r2: 0, c2: newC });
+    setEditingCell({ r: 0, c: newC });
+  }, [table, commit, isZh]);
 
-  const handleCycleAlign = useCallback(() => {
-    const col = focus ? focus.c : 0;
-    const cur = table.colAligns[col] || "left";
-    const nextAlign = ALIGN_ORDER[(ALIGN_ORDER.indexOf(cur) + 1) % ALIGN_ORDER.length];
-    const nextAligns = table.colAligns.map((a, i) => (i === col ? nextAlign : a));
-    commit({ ...table, colAligns: nextAligns });
-  }, [table, commit, focus]);
-
-  const handleCopyMarkdown = useCallback(async () => {
-    const md = tableToMarkdown(table);
-    try {
-      await navigator.clipboard.writeText(md);
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = md;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand?.("copy");
-      ta.remove();
-    }
-    setCopiedMd(true);
-    setTimeout(() => setCopiedMd(false), 1600);
-  }, [table]);
+  const moveFocusTo = useCallback(
+    (r, c, edit = true) => {
+      const anchor = getCellAnchor(table, r, c);
+      setRange({ r1: anchor.r, c1: anchor.c, r2: anchor.r, c2: anchor.c });
+      setEditingCell(edit ? anchor : null);
+    },
+    [table]
+  );
 
   // Column width drag resizing
   const startColResize = useCallback(
@@ -198,7 +410,7 @@ export default function TableCard({
       if (readOnly || !isActive) return;
       e.preventDefault();
       e.stopPropagation();
-      const wrapWidth = tableWrapRef.current?.clientWidth || element.width || 440;
+      const wrapWidth = tableElRef.current?.offsetWidth || element.width || 460;
       const totalWeight =
         table.colWidths.reduce((s, v) => s + v, 0) || table.colWidths.length * 100;
       const pxPerWeight = wrapWidth / totalWeight;
@@ -219,22 +431,26 @@ export default function TableCard({
         const minW = 48;
         if (st.colIdx < next.length - 1) {
           const sumPair = st.startWidths[st.colIdx] + st.startWidths[st.colIdx + 1];
-          const w1 = Math.max(minW, Math.min(sumPair - minW, st.startWidths[st.colIdx] + deltaWeight));
+          const w1 = Math.max(
+            minW,
+            Math.min(sumPair - minW, st.startWidths[st.colIdx] + deltaWeight)
+          );
           next[st.colIdx] = Math.round(w1);
           next[st.colIdx + 1] = Math.round(sumPair - w1);
         } else {
-          next[st.colIdx] = Math.round(Math.max(minW, st.startWidths[st.colIdx] + deltaWeight));
+          next[st.colIdx] = Math.round(
+            Math.max(minW, st.startWidths[st.colIdx] + deltaWeight)
+          );
         }
         setResizingWidths(next);
+        setLayoutTick((n) => n + 1);
       };
 
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
         setResizingWidths((latest) => {
-          if (latest) {
-            commit({ ...table, colWidths: latest });
-          }
+          if (latest) commit({ ...table, colWidths: latest });
           return null;
         });
         resizeStateRef.current = null;
@@ -246,33 +462,82 @@ export default function TableCard({
     [readOnly, isActive, table, element.width, commit]
   );
 
-  // Keyboard navigation inside cell editor
+  // End drag selection cleanly on window pointerup
+  useEffect(() => {
+    const onWinUp = () => {
+      draggingRef.current = false;
+    };
+    window.addEventListener("pointerup", onWinUp);
+    return () => window.removeEventListener("pointerup", onWinUp);
+  }, []);
+
+  // Keyboard navigation & inline Markdown shortcuts inside cell editor
   const handleCellKeyDown = useCallback(
     (e, r, c) => {
       e.stopPropagation();
       const rowCount = table.rows.length;
       const colCount = table.colWidths.length;
+      const cell = table.rows[r][c];
+      const ta = e.currentTarget;
+
+      // Inline Markdown shortcuts inside cell textarea
+      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+        const k = e.key.toLowerCase();
+        const applyMd = (res) => {
+          updateCell(r, c, { text: res.text });
+          requestAnimationFrame(() => {
+            if (editorRef.current) {
+              editorRef.current.focus();
+              editorRef.current.setSelectionRange(res.start, res.end);
+            }
+          });
+        };
+        if (!e.shiftKey && k === "b") {
+          e.preventDefault();
+          applyMd(applyInlineFormat(ta.value, ta.selectionStart, ta.selectionEnd, "bold"));
+          return;
+        }
+        if (!e.shiftKey && k === "i") {
+          e.preventDefault();
+          applyMd(applyInlineFormat(ta.value, ta.selectionStart, ta.selectionEnd, "italic"));
+          return;
+        }
+        if (!e.shiftKey && k === "e") {
+          e.preventDefault();
+          applyMd(applyInlineFormat(ta.value, ta.selectionStart, ta.selectionEnd, "code"));
+          return;
+        }
+        if (e.shiftKey && k === "x") {
+          e.preventDefault();
+          applyMd(applyInlineFormat(ta.value, ta.selectionStart, ta.selectionEnd, "strike"));
+          return;
+        }
+        if (e.shiftKey && k === "h") {
+          e.preventDefault();
+          applyMd(applyInlineHighlight(ta.value, ta.selectionStart, ta.selectionEnd, "yellow"));
+          return;
+        }
+      }
 
       if (e.key === "Escape") {
         e.preventDefault();
-        setFocus(null);
-        setOpenPicker(null);
+        setEditingCell(null);
         return;
       }
 
       if (e.key === "Tab") {
         e.preventDefault();
         if (e.shiftKey) {
-          if (c > 0) setFocus({ r, c: c - 1 });
-          else if (r > 0) setFocus({ r: r - 1, c: colCount - 1 });
+          if (c > 0) moveFocusTo(r, c - 1, true);
+          else if (r > 0) moveFocusTo(r - 1, colCount - 1, true);
         } else {
-          if (c < colCount - 1) {
-            setFocus({ r, c: c + 1 });
-          } else if (r < rowCount - 1) {
-            setFocus({ r: r + 1, c: 0 });
+          const nextC = c + (cell.colSpan || 1);
+          if (nextC < colCount) {
+            moveFocusTo(r, nextC, true);
+          } else if (r + 1 < rowCount) {
+            moveFocusTo(r + 1, 0, true);
           } else {
-            // Tab at last cell appends a new row automatically
-            handleAddRow(rowCount - 1);
+            handleAppendRow();
           }
         }
         return;
@@ -281,41 +546,87 @@ export default function TableCard({
       if (e.key === "Enter" && !e.shiftKey && !e.altKey) {
         if (e.isComposing || e.keyCode === 229) return;
         e.preventDefault();
-        if (r < rowCount - 1) {
-          setFocus({ r: r + 1, c });
+        const nextR = r + (cell.rowSpan || 1);
+        if (nextR < rowCount) {
+          moveFocusTo(nextR, c, true);
         } else {
-          handleAddRow(rowCount - 1);
+          handleAppendRow();
         }
         return;
       }
 
       if (e.key === "ArrowUp" && !e.shiftKey) {
-        const ta = e.currentTarget;
         const beforeCaret = ta.value.slice(0, ta.selectionStart);
         if (!beforeCaret.includes("\n") && r > 0) {
           e.preventDefault();
-          setFocus({ r: r - 1, c });
+          moveFocusTo(r - 1, c, true);
         }
         return;
       }
 
       if (e.key === "ArrowDown" && !e.shiftKey) {
-        const ta = e.currentTarget;
         const afterCaret = ta.value.slice(ta.selectionEnd);
-        if (!afterCaret.includes("\n") && r < rowCount - 1) {
+        const nextR = r + (cell.rowSpan || 1);
+        if (!afterCaret.includes("\n") && nextR < rowCount) {
           e.preventDefault();
-          setFocus({ r: r + 1, c });
+          moveFocusTo(nextR, c, true);
+        }
+      }
+    },
+    [table, updateCell, moveFocusTo, handleAppendRow]
+  );
+
+  // Card-level shortcuts when a range is selected (not actively typing in textarea)
+  const handleCardKeyDown = useCallback(
+    (e) => {
+      if (!isActive || readOnly) return;
+      e.stopPropagation();
+
+      if (editingCell) return;
+
+      // Ctrl/Cmd + Shift + M -> Merge or Split selected range
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "m") {
+        e.preventDefault();
+        if (expandedRange && canMergeRange(table, expandedRange)) {
+          commit(mergeCells(table, expandedRange));
+          setRange({
+            r1: expandedRange.r1,
+            c1: expandedRange.c1,
+            r2: expandedRange.r1,
+            c2: expandedRange.c1,
+          });
+        } else if (expandedRange && canSplitRange(table, expandedRange)) {
+          commit(splitCells(table, expandedRange));
         }
         return;
       }
 
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "b") {
+      if (e.key === "Enter" && expandedRange) {
         e.preventDefault();
-        const cell = table.rows[r][c];
-        updateCell(r, c, { bold: !cell.bold });
+        setEditingCell({ r: expandedRange.r1, c: expandedRange.c1 });
+        return;
+      }
+
+      if ((e.key === "Backspace" || e.key === "Delete") && expandedRange) {
+        e.preventDefault();
+        const nextRows = table.rows.map((row, ri) =>
+          row.map((cell, ci) => {
+            if (
+              ri >= expandedRange.r1 &&
+              ri <= expandedRange.r2 &&
+              ci >= expandedRange.c1 &&
+              ci <= expandedRange.c2 &&
+              !cell.mergedInto
+            ) {
+              return { ...cell, text: "" };
+            }
+            return cell;
+          })
+        );
+        commit({ ...table, rows: nextRows });
       }
     },
-    [table, handleAddRow, updateCell]
+    [isActive, readOnly, editingCell, expandedRange, table, commit]
   );
 
   // Smart paste from Excel / Feishu / Google Sheets (TSV) or Markdown pipe table
@@ -324,49 +635,40 @@ export default function TableCard({
       e.stopPropagation();
       const text = e.clipboardData?.getData("text/plain");
       const parsed = parseTabularPaste(text);
-      if (!parsed) return; // let normal text paste into the cell
+      if (!parsed) return;
 
       e.preventDefault();
       const pastedRows = parsed.rows;
       const pasteH = pastedRows.length;
       const pasteW = Math.max(...pastedRows.map((row) => row.length));
 
-      const targetRowsCount = Math.max(table.rows.length, startR + pasteH);
-      const targetColsCount = Math.max(table.colWidths.length, startC + pasteW);
+      let next = table;
+      while (next.rows.length < startR + pasteH) {
+        next = insertRowAt(next, next.rows.length);
+      }
+      while (next.colWidths.length < startC + pasteW) {
+        next = insertColAt(next, next.colWidths.length);
+      }
 
-      const nextWidths = [...table.colWidths];
-      const nextAligns = [...table.colAligns];
-      while (nextWidths.length < targetColsCount) nextWidths.push(130);
-      while (nextAligns.length < targetColsCount) nextAligns.push("left");
-
+      const nextAligns = [...next.colAligns];
       if (parsed.aligns && startR === 0 && startC === 0) {
         for (let i = 0; i < parsed.aligns.length && i < nextAligns.length; i += 1) {
           nextAligns[i] = parsed.aligns[i];
         }
       }
 
-      const nextRows = Array.from({ length: targetRowsCount }, (_, ri) => {
-        const existing = table.rows[ri] || [];
-        return Array.from({ length: targetColsCount }, (_, ci) =>
-          existing[ci] ? { ...existing[ci] } : createEmptyCell("")
-        );
-      });
-
+      const nextRows = next.rows.map((row) => row.map((c) => ({ ...c })));
       for (let dr = 0; dr < pasteH; dr += 1) {
         for (let dc = 0; dc < pastedRows[dr].length; dc += 1) {
-          nextRows[startR + dr][startC + dc] = {
-            ...nextRows[startR + dr][startC + dc],
+          const anchor = getCellAnchor(next, startR + dr, startC + dc);
+          nextRows[anchor.r][anchor.c] = {
+            ...nextRows[anchor.r][anchor.c],
             text: pastedRows[dr][dc],
           };
         }
       }
 
-      commit({
-        ...table,
-        colWidths: nextWidths,
-        colAligns: nextAligns,
-        rows: nextRows,
-      });
+      commit({ ...next, colAligns: nextAligns, rows: nextRows });
     },
     [table, commit]
   );
@@ -375,341 +677,283 @@ export default function TableCard({
 
   const effectiveWidths = resizingWidths || table.colWidths;
   const totalWeight = effectiveWidths.reduce((s, v) => s + v, 0) || 1;
-  const activeCell = focus ? table.rows[focus.r]?.[focus.c] : null;
-  const activeColAlign = focus ? table.colAligns[focus.c] || "left" : table.colAligns[0] || "left";
+  const fontFamilyStr = getElementFontFamilyStr(element);
+  const effectiveTable = resizingWidths
+    ? { ...table, colWidths: resizingWidths }
+    : table;
+
+  const isCellInSelection = (r, c, rs, cs) => {
+    if (!expandedRange) return false;
+    return (
+      r <= expandedRange.r2 &&
+      r + rs - 1 >= expandedRange.r1 &&
+      c <= expandedRange.c2 &&
+      c + cs - 1 >= expandedRange.c1
+    );
+  };
+
+  const isMultiSelect =
+    expandedRange &&
+    (expandedRange.r2 > expandedRange.r1 || expandedRange.c2 > expandedRange.c1) &&
+    canMergeRange(table, expandedRange);
+
   const customBg =
     element.backgroundColor && element.backgroundColor !== "transparent"
       ? element.backgroundColor
       : undefined;
 
-  const alignLabel =
-    activeColAlign === "center"
-      ? isZh
-        ? "居中"
-        : "Center"
-      : activeColAlign === "right"
-        ? isZh
-          ? "右对齐"
-          : "Right"
-        : isZh
-          ? "左对齐"
-          : "Left";
+  const inkColor =
+    element.strokeColor && element.strokeColor !== "transparent"
+      ? isDark &&
+        (element.strokeColor === "#1e1e1e" || element.strokeColor === "#000000")
+        ? "#e6e6ee"
+        : element.strokeColor
+      : undefined;
 
   return (
     <div
-      className={`table-card ${isDark ? "is-dark" : ""} ${
+      className={`table-card native-table-card ${isDark ? "is-dark" : ""} ${
         isActive ? "is-active" : ""
       }`}
-      style={customBg ? { backgroundColor: customBg } : undefined}
+      tabIndex={isActive ? 0 : -1}
+      style={{
+        fontFamily: fontFamilyStr,
+        backgroundColor: customBg,
+        color: inkColor,
+      }}
       onWheel={isActive ? stop : undefined}
       onCopy={isActive ? stop : undefined}
       onCut={isActive ? stop : undefined}
       onPaste={isActive ? stop : undefined}
-      onKeyDown={isActive ? stop : undefined}
+      onKeyDown={isActive ? handleCardKeyDown : undefined}
       onKeyUp={isActive ? stop : undefined}
     >
-      {isActive && !readOnly && (
-        <div
-          className="table-card-toolbar"
-          onPointerDown={stop}
-          onMouseDown={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-          }}
-        >
-          <div className="table-toolbar-group">
-            <span className="table-card-tag">
-              {table.rows.length}×{table.colWidths.length}
-            </span>
-            <button
-              type="button"
-              className="tbl-btn"
-              title={isZh ? "在下方插入一行" : "Insert row below"}
-              onClick={() => handleAddRow(focus ? focus.r : table.rows.length - 1)}
-            >
-              {isZh ? "+行" : "+Row"}
-            </button>
-            <button
-              type="button"
-              className="tbl-btn"
-              title={isZh ? "在右侧插入一列" : "Insert column right"}
-              onClick={handleAddCol}
-            >
-              {isZh ? "+列" : "+Col"}
-            </button>
-            <button
-              type="button"
-              className="tbl-btn danger"
-              disabled={table.rows.length <= 1}
-              title={isZh ? "删除当前行" : "Delete current row"}
-              onClick={handleDeleteRow}
-            >
-              {isZh ? "-行" : "-Row"}
-            </button>
-            <button
-              type="button"
-              className="tbl-btn danger"
-              disabled={table.colWidths.length <= 1}
-              title={isZh ? "删除当前列" : "Delete current column"}
-              onClick={handleDeleteCol}
-            >
-              {isZh ? "-列" : "-Col"}
-            </button>
-          </div>
-
-          <div className="table-toolbar-group">
-            <button
-              type="button"
-              className={`tbl-btn ${table.headerRow ? "active" : ""}`}
-              title={isZh ? "首行作为表头" : "Toggle header row"}
-              onClick={() => commit({ ...table, headerRow: !table.headerRow })}
-            >
-              {isZh ? "表头" : "Header"}
-            </button>
-            <button
-              type="button"
-              className={`tbl-btn ${table.striped ? "active" : ""}`}
-              title={isZh ? "隔行斑马纹" : "Toggle striped rows"}
-              onClick={() => commit({ ...table, striped: !table.striped })}
-            >
-              {isZh ? "斑马纹" : "Stripe"}
-            </button>
-            <button
-              type="button"
-              className="tbl-btn"
-              title={isZh ? "切换当前列对齐方式" : "Cycle column alignment"}
-              onClick={handleCycleAlign}
-            >
-              {alignLabel}
-            </button>
-
-            {activeCell && (
-              <>
-                <span className="tbl-sep" aria-hidden="true" />
-                <button
-                  type="button"
-                  className={`tbl-btn ${activeCell.bold ? "active" : ""}`}
-                  title={isZh ? "单元格加粗 (Ctrl+B)" : "Cell bold (Ctrl+B)"}
-                  onClick={() =>
-                    updateCell(focus.r, focus.c, { bold: !activeCell.bold })
-                  }
-                >
-                  <strong>B</strong>
-                </button>
-
-                <div className="tbl-picker-wrap">
-                  <button
-                    type="button"
-                    className={`tbl-btn tbl-swatch-trigger ${
-                      openPicker === "bg" ? "active" : ""
-                    }`}
-                    title={isZh ? "单元格背景色" : "Cell background color"}
-                    onClick={() =>
-                      setOpenPicker((p) => (p === "bg" ? null : "bg"))
-                    }
-                  >
-                    <span
-                      className="tbl-color-dot"
-                      style={{
-                        background:
-                          resolveCellBg(activeCell.bg, isDark) || "transparent",
-                      }}
-                    />
-                  </button>
-                  {openPicker === "bg" && (
-                    <div className="tbl-popover" onPointerDown={stop}>
-                      {TABLE_CELL_BG_PALETTE.map((c) => (
-                        <button
-                          key={String(c.id)}
-                          type="button"
-                          className={`tbl-pop-swatch ${
-                            activeCell.bg === c.id ? "active" : ""
-                          } ${c.id === null ? "is-none" : ""}`}
-                          style={
-                            c.id !== null
-                              ? { background: c.swatch }
-                              : undefined
-                          }
-                          title={isZh ? c.zh : c.en}
-                          onClick={() => {
-                            updateCell(focus.r, focus.c, { bg: c.id });
-                            setOpenPicker(null);
-                          }}
-                        >
-                          {c.id === null ? "×" : ""}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <div className="tbl-picker-wrap">
-                  <button
-                    type="button"
-                    className={`tbl-btn tbl-swatch-trigger ${
-                      openPicker === "color" ? "active" : ""
-                    }`}
-                    title={isZh ? "单元格文字颜色" : "Cell text color"}
-                    onClick={() =>
-                      setOpenPicker((p) => (p === "color" ? null : "color"))
-                    }
-                  >
-                    <span
-                      className="tbl-text-dot"
-                      style={{
-                        color:
-                          resolveCellTextColor(activeCell.color, isDark) ||
-                          "currentColor",
-                      }}
-                    >
-                      A
-                    </span>
-                  </button>
-                  {openPicker === "color" && (
-                    <div className="tbl-popover" onPointerDown={stop}>
-                      {TABLE_CELL_TEXT_PALETTE.map((c) => (
-                        <button
-                          key={String(c.id)}
-                          type="button"
-                          className={`tbl-pop-swatch ${
-                            activeCell.color === c.id ? "active" : ""
-                          } ${c.id === null ? "is-none" : ""}`}
-                          style={
-                            c.id !== null
-                              ? { background: c.swatch }
-                              : undefined
-                          }
-                          title={isZh ? c.zh : c.en}
-                          onClick={() => {
-                            updateCell(focus.r, focus.c, { color: c.id });
-                            setOpenPicker(null);
-                          }}
-                        >
-                          {c.id === null ? "×" : ""}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </>
-            )}
-
-            <span className="tbl-sep" aria-hidden="true" />
-            <button
-              type="button"
-              className="tbl-btn"
-              title={isZh ? "复制为 Markdown 表格" : "Copy as Markdown table"}
-              onClick={handleCopyMarkdown}
-            >
-              {copiedMd
-                ? isZh
-                  ? "已复制"
-                  : "Copied"
-                : isZh
-                  ? "复制 MD"
-                  : "Copy MD"}
-            </button>
-          </div>
-        </div>
-      )}
-
       <div
-        className="table-card-scroll"
+        className="table-card-stage"
         ref={tableWrapRef}
         onPointerDown={isActive ? stop : undefined}
       >
-        <table className={`canvas-table ${table.striped ? "is-striped" : ""}`}>
-          <colgroup>
-            {effectiveWidths.map((w, ci) => (
-              <col
-                key={ci}
-                style={{ width: `${((w / totalWeight) * 100).toFixed(3)}%` }}
-              />
-            ))}
-          </colgroup>
-          <tbody>
-            {table.rows.map((row, ri) => {
-              const isHeader = table.headerRow && ri === 0;
-              return (
-                <tr key={ri} className={isHeader ? "is-header" : ""}>
-                  {row.map((cell, ci) => {
-                    const isFocused =
-                      isActive && !readOnly && focus?.r === ri && focus?.c === ci;
-                    const align = table.colAligns[ci] || "left";
-                    const cellBg = resolveCellBg(cell.bg, isDark);
-                    const cellColor = resolveCellTextColor(cell.color, isDark);
-                    const Tag = isHeader ? "th" : "td";
+        <div className="table-grid-layer">
+          <NativeGridOverlay
+            table={effectiveTable}
+            tableElRef={tableElRef}
+            element={element}
+            isDark={isDark}
+            layoutTick={layoutTick}
+          />
 
-                    return (
-                      <Tag
-                        key={ci}
-                        className={`tbl-cell ${isFocused ? "is-focused" : ""} ${
-                          cell.bold ? "is-bold" : ""
-                        }`}
-                        style={{
-                          textAlign: align,
-                          backgroundColor: cellBg || undefined,
-                          color: cellColor || undefined,
-                        }}
-                        onClick={(e) => {
-                          if (!isActive || readOnly) return;
-                          e.stopPropagation();
-                          setOpenPicker(null);
-                          setFocus({ r: ri, c: ci });
-                        }}
-                      >
-                        {isFocused ? (
-                          <textarea
-                            ref={editorRef}
-                            className="tbl-cell-editor"
-                            rows={1}
-                            value={cell.text}
-                            style={{
-                              textAlign: align,
-                              fontWeight: isHeader || cell.bold ? 600 : 400,
-                            }}
-                            onChange={(e) => {
-                              e.target.style.height = "auto";
-                              e.target.style.height = `${e.target.scrollHeight}px`;
-                              updateCell(ri, ci, { text: e.target.value });
-                            }}
-                            onKeyDown={(e) => handleCellKeyDown(e, ri, ci)}
-                            onPaste={(e) => handleCellPaste(e, ri, ci)}
-                          />
-                        ) : (
-                          <div className="tbl-cell-view">
-                            {cell.text || (isActive && !readOnly ? "\u00A0" : "")}
-                          </div>
-                        )}
+          <table
+            ref={tableElRef}
+            className={`canvas-table native-canvas-table ${
+              table.striped ? "is-striped" : ""
+            }`}
+          >
+            <colgroup>
+              {effectiveWidths.map((w, ci) => (
+                <col
+                  key={ci}
+                  style={{ width: `${((w / totalWeight) * 100).toFixed(3)}%` }}
+                />
+              ))}
+            </colgroup>
+            <tbody>
+              {table.rows.map((row, ri) => {
+                const isHeader = table.headerRow && ri === 0;
+                return (
+                  <tr key={ri} className={isHeader ? "is-header" : ""}>
+                    {row.map((cell, ci) => {
+                      if (cell.mergedInto) return null;
 
-                        {isActive && !readOnly && ci < table.colWidths.length - 1 && (
-                          <span
-                            className="tbl-col-resizer"
-                            title={isZh ? "拖动调整列宽" : "Drag to resize column"}
-                            onPointerDown={(e) => startColResize(e, ci)}
-                            onClick={stop}
-                          />
-                        )}
-                      </Tag>
-                    );
-                  })}
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+                      const rs = cell.rowSpan || 1;
+                      const cs = cell.colSpan || 1;
+                      const isEditing =
+                        isActive &&
+                        !readOnly &&
+                        editingCell?.r === ri &&
+                        editingCell?.c === ci;
+                      const isSelected =
+                        isActive && !readOnly && isCellInSelection(ri, ci, rs, cs);
+                      const align = table.colAligns[ci] || "left";
+                      const cellBg = resolveCellBg(cell.bg, isDark);
+                      const cellColor = resolveCellTextColor(cell.color, isDark);
+                      const Tag = isHeader ? "th" : "td";
 
+                      return (
+                        <Tag
+                          key={ci}
+                          rowSpan={rs > 1 ? rs : undefined}
+                          colSpan={cs > 1 ? cs : undefined}
+                          className={`tbl-cell ${
+                            isEditing ? "is-editing" : ""
+                          } ${isSelected ? "is-selected" : ""} ${
+                            isSelected && isMultiSelect ? "is-range" : ""
+                          } ${cell.bold ? "is-bold" : ""}`}
+                          style={{
+                            textAlign: align,
+                            backgroundColor: cellBg || undefined,
+                            color: cellColor || undefined,
+                          }}
+                          onPointerDown={(e) => {
+                            if (!isActive || readOnly) return;
+                            if (e.button !== 0) return;
+                            e.stopPropagation();
+
+                            // If already editing this exact cell, let native textarea selection work
+                            if (isEditing) return;
+
+                            if (e.shiftKey && range) {
+                              e.preventDefault();
+                              setEditingCell(null);
+                              setRange({
+                                r1: range.r1,
+                                c1: range.c1,
+                                r2: ri + rs - 1,
+                                c2: ci + cs - 1,
+                              });
+                              return;
+                            }
+
+                            dragOriginRef.current = {
+                              r1: ri,
+                              c1: ci,
+                              r2: ri + rs - 1,
+                              c2: ci + cs - 1,
+                            };
+                            draggingRef.current = true;
+                            setRange({
+                              r1: ri,
+                              c1: ci,
+                              r2: ri + rs - 1,
+                              c2: ci + cs - 1,
+                            });
+                            setEditingCell(null);
+                          }}
+                          onPointerEnter={() => {
+                            if (!draggingRef.current || !dragOriginRef.current) return;
+                            const orig = dragOriginRef.current;
+                            const nextRange = {
+                              r1: Math.min(orig.r1, ri),
+                              c1: Math.min(orig.c1, ci),
+                              r2: Math.max(orig.r2, ri + rs - 1),
+                              c2: Math.max(orig.c2, ci + cs - 1),
+                            };
+                            setRange(nextRange);
+                            setEditingCell(null);
+                          }}
+                          onClick={(e) => {
+                            if (!isActive || readOnly) return;
+                            e.stopPropagation();
+                            if (e.shiftKey) return;
+                            // Single click on a single cell (no drag range) opens inline editor directly!
+                            if (
+                              !isEditing &&
+                              dragOriginRef.current &&
+                              dragOriginRef.current.r1 === ri &&
+                              dragOriginRef.current.c1 === ci &&
+                              expandedRange &&
+                              expandedRange.r1 === ri &&
+                              expandedRange.c1 === ci &&
+                              expandedRange.r2 === ri + rs - 1 &&
+                              expandedRange.c2 === ci + cs - 1
+                            ) {
+                              setEditingCell({ r: ri, c: ci });
+                            }
+                          }}
+                          onDoubleClick={(e) => {
+                            if (!isActive || readOnly) return;
+                            e.stopPropagation();
+                            setRange({
+                              r1: ri,
+                              c1: ci,
+                              r2: ri + rs - 1,
+                              c2: ci + cs - 1,
+                            });
+                            setEditingCell({ r: ri, c: ci });
+                          }}
+                        >
+                          {isEditing ? (
+                            <textarea
+                              ref={editorRef}
+                              className="tbl-cell-editor"
+                              rows={1}
+                              value={cell.text}
+                              style={{
+                                textAlign: align,
+                                fontWeight: isHeader || cell.bold ? 600 : 400,
+                              }}
+                              onPointerDown={stop}
+                              onChange={(e) => {
+                                e.target.style.height = "auto";
+                                e.target.style.height = `${e.target.scrollHeight}px`;
+                                updateCell(ri, ci, { text: e.target.value });
+                              }}
+                              onKeyDown={(e) => handleCellKeyDown(e, ri, ci)}
+                              onPaste={(e) => handleCellPaste(e, ri, ci)}
+                            />
+                          ) : (
+                            <CellMarkdown
+                              text={cell.text}
+                              readOnly={readOnly || !isActive}
+                              onToggleTask={(lineIdx) => {
+                                const nextText = toggleCellTaskAtLine(
+                                  cell.text,
+                                  lineIdx
+                                );
+                                updateCell(ri, ci, { text: nextText });
+                              }}
+                            />
+                          )}
+
+                          {isActive &&
+                            !readOnly &&
+                            ci + cs < table.colWidths.length && (
+                              <span
+                                className="tbl-col-resizer"
+                                title={isZh ? "拖动调整列宽" : "Drag to resize column"}
+                                onPointerDown={(e) => startColResize(e, ci + cs - 1)}
+                                onClick={stop}
+                              />
+                            )}
+                        </Tag>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Feishu-style right '+' column adder rail */}
         {isActive && !readOnly && (
           <button
             type="button"
-            className="tbl-quick-add-row"
+            className="tbl-edge-add tbl-edge-add-col"
+            title={isZh ? "右侧添加一列" : "Add column"}
+            aria-label={isZh ? "添加列" : "Add column"}
             onPointerDown={stop}
-            onClick={() => handleAddRow(table.rows.length - 1)}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={handleAppendCol}
           >
-            {isZh ? "+ 添加行" : "+ Add row"}
+            +
           </button>
         )}
       </div>
+
+      {/* Feishu-style bottom '+' row adder rail */}
+      {isActive && !readOnly && (
+        <button
+          type="button"
+          className="tbl-edge-add tbl-edge-add-row"
+          title={isZh ? "底部添加一行" : "Add row"}
+          aria-label={isZh ? "添加行" : "Add row"}
+          onPointerDown={stop}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={handleAppendRow}
+        >
+          +
+        </button>
+      )}
     </div>
   );
 }

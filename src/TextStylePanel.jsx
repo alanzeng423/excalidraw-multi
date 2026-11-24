@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   CJK_FONTS,
-  QUICK_CJK_FONT_IDS,
   ensureCjkFontLoaded,
   getCjkFontById,
   getDefaultCjkFontId,
@@ -25,6 +24,24 @@ import {
   clearMarkdownFormatting,
   detectActiveFormats,
 } from "./textFormatting";
+import {
+  TABLE_CELL_BG_PALETTE,
+  TABLE_CELL_TEXT_PALETTE,
+  canMergeRange,
+  canSplitRange,
+  deleteColAt,
+  deleteRowAt,
+  expandSelectionForMerges,
+  getTableSelection,
+  insertColAt,
+  insertRowAt,
+  mergeCells,
+  normalizeTableData,
+  onTableSelectionChange,
+  setTableSelection,
+  splitCells,
+  tableToMarkdown,
+} from "./tableData";
 
 const EMPTY_ACTIVE = {
   block: null,
@@ -44,7 +61,6 @@ function getTargetTextElements(api) {
   const result = [];
   const seen = new Set();
 
-  // Include actively edited text element if any
   const editingId = appState?.editingTextElement?.id;
   if (editingId) {
     const ed = byId.get(editingId);
@@ -79,35 +95,44 @@ function getTargetTextElements(api) {
   return result;
 }
 
+function getSelectedTableElement(api) {
+  if (!api) return null;
+  const appState = api.getAppState();
+  const elements = api.getSceneElementsIncludingDeleted();
+  const byId = new Map(elements.map((el) => [el.id, el]));
+
+  const activeEmb = appState?.activeEmbeddable?.element;
+  if (activeEmb?.id) {
+    const cur = byId.get(activeEmb.id);
+    if (
+      cur &&
+      !cur.isDeleted &&
+      (cur.customData?.type === "table" || cur.link?.startsWith("table://"))
+    ) {
+      return cur;
+    }
+  }
+
+  const selectedIds = appState?.selectedElementIds || {};
+  for (const id of Object.keys(selectedIds)) {
+    if (!selectedIds[id]) continue;
+    const el = byId.get(id);
+    if (
+      el &&
+      !el.isDeleted &&
+      (el.customData?.type === "table" || el.link?.startsWith("table://"))
+    ) {
+      return el;
+    }
+  }
+  return null;
+}
+
 function findPanelColumn() {
   return (
     document.querySelector(".App-menu__left .panelColumn") ||
     document.querySelector(".App-mobile-menu .panelColumn")
   );
-}
-
-function findCjkAnchor(panelCol) {
-  // Place right below Excalidraw's native English "Font family" picker (i.e. right before Font Size)
-  const fontSizeCtrl = panelCol.querySelector('[name="font-size"]');
-  if (fontSizeCtrl) {
-    const fs = fontSizeCtrl.closest("fieldset");
-    if (fs && fs.parentElement === panelCol) return { before: fs };
-  }
-  const fontFamilyCtrl = panelCol.querySelector('[name="font-family"]');
-  if (fontFamilyCtrl) {
-    const fs = fontFamilyCtrl.closest("fieldset");
-    if (fs && fs.parentElement === panelCol) return { after: fs };
-  }
-  const wysiwyg = document.querySelector("textarea.excalidraw-wysiwyg");
-  if (wysiwyg) {
-    const range = panelCol.querySelector('input[type="range"]');
-    const opacityFs = range?.closest("fieldset");
-    if (opacityFs && opacityFs.parentElement === panelCol) {
-      return { before: opacityFs };
-    }
-    return { append: true };
-  }
-  return null;
 }
 
 function findStyleAnchor(panelCol) {
@@ -136,6 +161,15 @@ function findStyleAnchor(panelCol) {
   return null;
 }
 
+function findTablePanelAnchor(panelCol) {
+  const range = panelCol.querySelector('input[type="range"]');
+  const opacityFs = range?.closest("fieldset");
+  if (opacityFs && opacityFs.parentElement === panelCol) {
+    return { before: opacityFs };
+  }
+  return { append: true };
+}
+
 function mountHostAtAnchor(panelCol, hostRef, className, anchor) {
   if (!panelCol || !anchor) {
     if (hostRef.current) {
@@ -144,14 +178,12 @@ function mountHostAtAnchor(panelCol, hostRef, className, anchor) {
     }
     return null;
   }
-
   let el = hostRef.current;
   if (!el) {
     el = document.createElement("div");
     el.className = className;
     hostRef.current = el;
   }
-
   if (anchor.after) {
     if (el.previousElementSibling !== anchor.after || el.parentElement !== panelCol) {
       anchor.after.insertAdjacentElement("afterend", el);
@@ -172,28 +204,42 @@ export default function TextStylePanel({
   nativeMd,
   onToggleNativeMd,
   onEnsureNativeMd,
+  onUpdateTable,
   readOnly,
 }) {
-  const [cjkHostEl, setCjkHostEl] = useState(null);
+  // 1. Fused Chinese font button inside native .FontPicker__container
+  const [cjkBtnHostEl, setCjkBtnHostEl] = useState(null);
+  // 2. Native text Markdown style panel
   const [styleHostEl, setStyleHostEl] = useState(null);
+  // 3. Table controls panel (when a Table Card is selected/active)
+  const [tableHostEl, setTableHostEl] = useState(null);
+  const [selectedTableEl, setSelectedTableEl] = useState(null);
+  const [tableSel, setTableSel] = useState(() => getTableSelection());
+  const [copiedTableMd, setCopiedTableMd] = useState(false);
+
   const [active, setActive] = useState(EMPTY_ACTIVE);
   const [isEditingText, setIsEditingText] = useState(false);
   const [activeCjkFont, setActiveCjkFont] = useState(() => getDefaultCjkFontId());
-  const [cjkMenuOpen, setCjkMenuOpen] = useState(false);
+  const [cjkPopover, setCjkPopover] = useState(null); // { top, left } | null
 
-  const cjkHostRef = useRef(null);
+  const cjkBtnHostRef = useRef(null);
   const styleHostRef = useRef(null);
+  const tableHostRef = useRef(null);
+  const popoverRef = useRef(null);
   const lastSelRef = useRef({ start: 0, end: 0 });
   const isZh = langCode === "zh-CN";
 
+  useEffect(() => onTableSelectionChange(setTableSel), []);
+
   const refreshActiveState = useCallback(() => {
+    const tblEl = getSelectedTableElement(api);
+    setSelectedTableEl(tblEl);
+
     const textEls = getTargetTextElements(api);
-    if (textEls.length > 0) {
-      const resolved = resolveCjkFontId(
-        textEls[0].customData?.cjkFont,
-        textEls[0].id
-      );
-      setActiveCjkFont(resolved);
+    if (tblEl) {
+      setActiveCjkFont(resolveCjkFontId(tblEl.customData?.cjkFont, tblEl.id));
+    } else if (textEls.length > 0) {
+      setActiveCjkFont(resolveCjkFontId(textEls[0].customData?.cjkFont, textEls[0].id));
     } else {
       setActiveCjkFont(getDefaultCjkFontId());
     }
@@ -218,30 +264,71 @@ export default function TextStylePanel({
 
   const syncPortalHosts = useCallback(() => {
     if (readOnly) {
-      mountHostAtAnchor(null, cjkHostRef, "md-cjk-panel-host", null);
-      mountHostAtAnchor(null, styleHostRef, "md-style-panel-host", null);
-      setCjkHostEl(null);
+      cjkBtnHostRef.current?.remove();
+      cjkBtnHostRef.current = null;
+      styleHostRef.current?.remove();
+      styleHostRef.current = null;
+      tableHostRef.current?.remove();
+      tableHostRef.current = null;
+      setCjkBtnHostEl(null);
       setStyleHostEl(null);
+      setTableHostEl(null);
       return;
     }
 
     const panelCol = findPanelColumn();
-    const nextCjk = mountHostAtAnchor(
-      panelCol,
-      cjkHostRef,
-      "md-cjk-panel-host",
-      panelCol ? findCjkAnchor(panelCol) : null
-    );
+    if (!panelCol) {
+      cjkBtnHostRef.current?.remove();
+      cjkBtnHostRef.current = null;
+      styleHostRef.current?.remove();
+      styleHostRef.current = null;
+      tableHostRef.current?.remove();
+      tableHostRef.current = null;
+      setCjkBtnHostEl(null);
+      setStyleHostEl(null);
+      setTableHostEl(null);
+      return;
+    }
+
+    // 1. Mount compact Chinese font button directly inside Excalidraw's .FontPicker__container
+    const fontContainer = panelCol.querySelector(".FontPicker__container");
+    if (fontContainer) {
+      let btnHost = cjkBtnHostRef.current;
+      if (!btnHost) {
+        btnHost = document.createElement("div");
+        btnHost.className = "md-cjk-btn-host";
+        cjkBtnHostRef.current = btnHost;
+      }
+      if (btnHost.parentElement !== fontContainer) {
+        fontContainer.appendChild(btnHost);
+      }
+      setCjkBtnHostEl((prev) => (prev === btnHost ? prev : btnHost));
+    } else {
+      cjkBtnHostRef.current?.remove();
+      cjkBtnHostRef.current = null;
+      setCjkBtnHostEl(null);
+    }
+
+    // 2. Mount native text style panel (only when text controls or wysiwyg exist)
     const nextStyle = mountHostAtAnchor(
       panelCol,
       styleHostRef,
       "md-style-panel-host",
-      panelCol ? findStyleAnchor(panelCol) : null
+      findStyleAnchor(panelCol)
     );
-
-    setCjkHostEl((prev) => (prev === nextCjk ? prev : nextCjk));
     setStyleHostEl((prev) => (prev === nextStyle ? prev : nextStyle));
-  }, [readOnly]);
+
+    // 3. Mount Table style & structure panel when a Table Card is selected/active
+    const tblEl = getSelectedTableElement(api);
+    setSelectedTableEl(tblEl);
+    const nextTable = mountHostAtAnchor(
+      panelCol,
+      tableHostRef,
+      "md-table-panel-host",
+      tblEl ? findTablePanelAnchor(panelCol) : null
+    );
+    setTableHostEl((prev) => (prev === nextTable ? prev : nextTable));
+  }, [api, readOnly]);
 
   useEffect(() => {
     syncPortalHosts();
@@ -278,22 +365,54 @@ export default function TextStylePanel({
       document.removeEventListener("input", onSelEvent, true);
       document.removeEventListener("focusin", scheduleSync, true);
       unsubApi?.();
-      cjkHostRef.current?.remove();
-      cjkHostRef.current = null;
+      cjkBtnHostRef.current?.remove();
+      cjkBtnHostRef.current = null;
       styleHostRef.current?.remove();
       styleHostRef.current = null;
+      tableHostRef.current?.remove();
+      tableHostRef.current = null;
     };
   }, [api, syncPortalHosts, refreshActiveState]);
 
-  // Preload menu preview glyphs when opening the Chinese font list
+  // Close floating Chinese font popover on outside click or Escape
   useEffect(() => {
-    if (!cjkMenuOpen) return;
+    if (!cjkPopover) return;
     for (const f of CJK_FONTS) {
-      if (f.cssUrl) {
-        ensureCjkFontLoaded(f.id, f.zh);
-      }
+      if (f.cssUrl) ensureCjkFontLoaded(f.id, f.zh);
     }
-  }, [cjkMenuOpen]);
+    const onDown = (e) => {
+      if (popoverRef.current?.contains(e.target)) return;
+      if (e.target.closest?.(".md-cjk-inline-btn, .md-cjk-table-trigger")) return;
+      setCjkPopover(null);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") setCjkPopover(null);
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [cjkPopover]);
+
+  const toggleCjkPopover = useCallback((triggerEl) => {
+    setCjkPopover((prev) => {
+      if (prev) return null;
+      const panel = document.querySelector(".App-menu__left") || triggerEl;
+      const panelRect = panel?.getBoundingClientRect();
+      const trigRect = triggerEl?.getBoundingClientRect();
+      const left = Math.min(
+        window.innerWidth - 236,
+        (panelRect ? panelRect.right : trigRect?.right || 200) + 10
+      );
+      const top = Math.max(
+        56,
+        Math.min(window.innerHeight - 380, (trigRect?.top || 140) - 24)
+      );
+      return { top, left };
+    });
+  }, []);
 
   const applyCjkFont = useCallback(
     (fontId) => {
@@ -306,6 +425,43 @@ export default function TextStylePanel({
         return;
       }
 
+      // Case 1: Selected Table Card
+      const tblEl = getSelectedTableElement(api);
+      if (tblEl) {
+        const allElements = api.getSceneElementsIncludingDeleted();
+        let updatedCard = null;
+        const nextElements = allElements.map((el) => {
+          if (el.id !== tblEl.id) return el;
+          updatedCard = {
+            ...el,
+            version: (el.version || 0) + 1,
+            versionNonce: Math.floor(Math.random() * 2147483647),
+            updated: Date.now(),
+            customData: { ...(el.customData || {}), cjkFont: fontId },
+          };
+          return updatedCard;
+        });
+        if (updatedCard) {
+          const curAppState = api.getAppState();
+          const keepActive =
+            curAppState.activeEmbeddable?.element?.id === tblEl.id &&
+            curAppState.activeEmbeddable?.state === "active";
+          api.updateScene({
+            elements: nextElements,
+            ...(keepActive
+              ? {
+                  appState: {
+                    activeEmbeddable: { element: updatedCard, state: "active" },
+                  },
+                }
+              : {}),
+          });
+        }
+        ensureCjkFontLoaded(fontId).then(() => api.refresh?.());
+        return;
+      }
+
+      // Case 2: Text element(s) or shape-bound text
       const targetTextEls = getTargetTextElements(api);
       const sampleText =
         targetTextEls.map((el) => el.text || el.originalText || "").join("") ||
@@ -326,10 +482,7 @@ export default function TextStylePanel({
         unmarkLegacyTextId(el.id);
         const updatedEl = {
           ...el,
-          customData: {
-            ...(el.customData || {}),
-            cjkFont: fontId,
-          },
+          customData: { ...(el.customData || {}), cjkFont: fontId },
         };
         const fontFamilyStr = getElementFontFamilyStr(updatedEl);
         const measured = measureNativeTextBox(
@@ -350,19 +503,12 @@ export default function TextStylePanel({
           const pad = 10;
           nextW = Math.min(measured.width, Math.max(20, container.width - pad * 2));
           nextX = container.x + (container.width - nextW) / 2;
-          if (el.verticalAlign === "top") {
-            nextY = container.y + pad;
-          } else if (el.verticalAlign === "bottom") {
-            nextY = container.y + container.height - nextH - pad;
-          } else {
-            nextY = container.y + (container.height - nextH) / 2;
-          }
+          if (el.verticalAlign === "top") nextY = container.y + pad;
+          else if (el.verticalAlign === "bottom") nextY = container.y + container.height - nextH - pad;
+          else nextY = container.y + (container.height - nextH) / 2;
         } else {
-          if (el.textAlign === "center") {
-            nextX = el.x + (el.width - nextW) / 2;
-          } else if (el.textAlign === "right") {
-            nextX = el.x + (el.width - nextW);
-          }
+          if (el.textAlign === "center") nextX = el.x + (el.width - nextW) / 2;
+          else if (el.textAlign === "right") nextX = el.x + (el.width - nextW);
         }
 
         return {
@@ -393,7 +539,6 @@ export default function TextStylePanel({
 
       api.updateScene({ elements: finalElements });
 
-      // If currently typing in wysiwyg, update live textarea fontFamily immediately
       const ta = document.querySelector("textarea.excalidraw-wysiwyg");
       if (ta && targetTextEls[0]) {
         const updatedFirst = finalElements.find((el) => el.id === targetTextEls[0].id);
@@ -402,7 +547,6 @@ export default function TextStylePanel({
         }
       }
 
-      // Load remote sliced webfont and refresh canvas once glyphs arrive
       ensureCjkFontLoaded(fontId, sampleText).then(() => {
         api.refresh?.();
       });
@@ -410,14 +554,14 @@ export default function TextStylePanel({
     [api, readOnly]
   );
 
-  const applyAction = useCallback(
+  // ===== Native Text Box Formatting =====
+  const applyTextAction = useCallback(
     (action) => {
       if (readOnly) return;
       if (action.type !== "clear" && !nativeMd) {
         onEnsureNativeMd?.();
       }
 
-      // Mode A: Currently editing inside Excalidraw's live wysiwyg textarea
       const ta = document.querySelector("textarea.excalidraw-wysiwyg");
       if (ta) {
         const start =
@@ -432,7 +576,21 @@ export default function TextStylePanel({
         const clampedEnd = Math.max(clampedStart, Math.min(end, ta.value.length));
 
         let res;
-        if (action.type === "block") {
+        if (action.type === "insert-md-table") {
+          const tpl = isZh
+            ? "| 列1 | 列2 | 列3 |\n| --- | :---: | ---: |\n| 内容 | **重点** | ==高亮== |\n| 示例 | {c:red}红色{/c} | 备注 |"
+            : "| Col 1 | Col 2 | Col 3 |\n| --- | :---: | ---: |\n| Item | **Bold** | ==Note== |\n| Row | {c:red}Red{/c} | Info |";
+          const before = ta.value.slice(0, clampedStart);
+          const after = ta.value.slice(clampedEnd);
+          const prefixNl = before && !before.endsWith("\n") ? "\n" : "";
+          const suffixNl = after && !after.startsWith("\n") ? "\n" : "";
+          const inserted = `${prefixNl}${tpl}${suffixNl}`;
+          res = {
+            text: before + inserted + after,
+            start: clampedStart + prefixNl.length,
+            end: clampedStart + prefixNl.length + tpl.length,
+          };
+        } else if (action.type === "block") {
           res = applyBlockFormat(ta.value, clampedStart, clampedEnd, action.kind);
         } else if (action.type === "inline") {
           res = applyInlineFormat(ta.value, clampedStart, clampedEnd, action.kind);
@@ -462,7 +620,6 @@ export default function TextStylePanel({
         return;
       }
 
-      // Mode B: Text element(s) or shape(s) with bound text selected on canvas
       if (!api) return;
       const targetTextEls = getTargetTextElements(api);
       if (targetTextEls.length === 0) return;
@@ -476,7 +633,15 @@ export default function TextStylePanel({
       const nextElements = allElements.map((el) => {
         if (!targetIds.has(el.id) || el.isDeleted) return el;
         const currentRaw = el.originalText ?? el.text ?? "";
-        const nextRaw = applyFormatToWholeText(currentRaw, action);
+        let nextRaw;
+        if (action.type === "insert-md-table") {
+          const tpl = isZh
+            ? "| 列1 | 列2 | 列3 |\n| --- | :---: | ---: |\n| 内容 | **重点** | ==高亮== |\n| 示例 | {c:red}红色{/c} | 备注 |"
+            : "| Col 1 | Col 2 | Col 3 |\n| --- | :---: | ---: |\n| Item | **Bold** | ==Note== |\n| Row | {c:red}Red{/c} | Info |";
+          nextRaw = currentRaw.trim() ? `${currentRaw}\n${tpl}` : tpl;
+        } else {
+          nextRaw = applyFormatToWholeText(currentRaw, action);
+        }
         if (nextRaw === currentRaw) return el;
 
         changed = true;
@@ -499,19 +664,12 @@ export default function TextStylePanel({
           const pad = 10;
           nextW = Math.min(measured.width, Math.max(20, container.width - pad * 2));
           nextX = container.x + (container.width - nextW) / 2;
-          if (el.verticalAlign === "top") {
-            nextY = container.y + pad;
-          } else if (el.verticalAlign === "bottom") {
-            nextY = container.y + container.height - nextH - pad;
-          } else {
-            nextY = container.y + (container.height - nextH) / 2;
-          }
+          if (el.verticalAlign === "top") nextY = container.y + pad;
+          else if (el.verticalAlign === "bottom") nextY = container.y + container.height - nextH - pad;
+          else nextY = container.y + (container.height - nextH) / 2;
         } else {
-          if (el.textAlign === "center") {
-            nextX = el.x + (el.width - nextW) / 2;
-          } else if (el.textAlign === "right") {
-            nextX = el.x + (el.width - nextW);
-          }
+          if (el.textAlign === "center") nextX = el.x + (el.width - nextW) / 2;
+          else if (el.textAlign === "right") nextX = el.x + (el.width - nextW);
         }
 
         return {
@@ -547,10 +705,102 @@ export default function TextStylePanel({
       api.updateScene({ elements: finalElements });
       requestAnimationFrame(refreshActiveState);
     },
-    [api, nativeMd, onEnsureNativeMd, readOnly, refreshActiveState]
+    [api, isZh, nativeMd, onEnsureNativeMd, readOnly, refreshActiveState]
   );
 
-  // Rich-text keyboard shortcuts while typing inside textarea.excalidraw-wysiwyg
+  // ===== Table Panel Actions (act on selected Table Card & its active range) =====
+  const activeTable = selectedTableEl
+    ? normalizeTableData(selectedTableEl.customData?.table)
+    : null;
+  const currentRange =
+    activeTable && tableSel?.elementId === selectedTableEl?.id && tableSel?.range
+      ? expandSelectionForMerges(activeTable, tableSel.range)
+      : activeTable
+        ? { r1: 0, c1: 0, r2: 0, c2: 0 }
+        : null;
+
+  const commitTable = useCallback(
+    (nextTable, nextRange) => {
+      if (!selectedTableEl || !onUpdateTable) return;
+      onUpdateTable(selectedTableEl.id, nextTable);
+      if (nextRange !== undefined) {
+        setTableSelection({
+          elementId: selectedTableEl.id,
+          range: nextRange,
+          editingCell: null,
+        });
+      }
+    },
+    [selectedTableEl, onUpdateTable]
+  );
+
+  const patchSelectedTableCells = useCallback(
+    (patchOrFn) => {
+      if (!activeTable || !currentRange) return;
+      const nextRows = activeTable.rows.map((row, ri) =>
+        row.map((cell, ci) => {
+          if (
+            ri >= currentRange.r1 &&
+            ri <= currentRange.r2 &&
+            ci >= currentRange.c1 &&
+            ci <= currentRange.c2 &&
+            !cell.mergedInto
+          ) {
+            const patch =
+              typeof patchOrFn === "function" ? patchOrFn(cell) : patchOrFn;
+            return { ...cell, ...patch };
+          }
+          return cell;
+        })
+      );
+      commitTable({ ...activeTable, rows: nextRows });
+    },
+    [activeTable, currentRange, commitTable]
+  );
+
+  const applyTableCellMarkdown = useCallback(
+    (action) => {
+      if (!activeTable || !currentRange) return;
+
+      // If user is actively editing a table cell textarea, apply to its selection range!
+      const cellTa = document.querySelector("textarea.tbl-cell-editor");
+      if (cellTa && tableSel?.editingCell) {
+        const s = cellTa.selectionStart ?? 0;
+        const e = cellTa.selectionEnd ?? s;
+        let res;
+        if (action.type === "inline") res = applyInlineFormat(cellTa.value, s, e, action.kind);
+        else if (action.type === "color") res = applyInlineColor(cellTa.value, s, e, action.color);
+        else if (action.type === "highlight") res = applyInlineHighlight(cellTa.value, s, e, action.color);
+        else if (action.type === "clear") res = clearMarkdownFormatting(cellTa.value, s, e);
+        else if (action.type === "block") res = applyBlockFormat(cellTa.value, s, e, action.kind);
+        if (!res) return;
+
+        const { r, c } = tableSel.editingCell;
+        const nextRows = activeTable.rows.map((row, ri) =>
+          ri !== r
+            ? row
+            : row.map((cell, ci) => (ci !== c ? cell : { ...cell, text: res.text }))
+        );
+        commitTable({ ...activeTable, rows: nextRows });
+        requestAnimationFrame(() => {
+          const curTa = document.querySelector("textarea.tbl-cell-editor");
+          if (curTa) {
+            curTa.focus();
+            curTa.setSelectionRange(res.start, res.end);
+          }
+        });
+        return;
+      }
+
+      // Otherwise apply to all selected anchor cells' text
+      patchSelectedTableCells((cell) => ({
+        text: applyFormatToWholeText(cell.text, action),
+      }));
+    },
+    [activeTable, currentRange, tableSel, commitTable, patchSelectedTableCells]
+  );
+
+  // Rich-text keyboard shortcuts inside native Excalidraw wysiwyg textarea
   useEffect(() => {
     if (readOnly) return;
     const onKeyDown = (e) => {
@@ -566,28 +816,28 @@ export default function TextStylePanel({
       if (!e.shiftKey && key === "b") {
         e.preventDefault();
         e.stopPropagation();
-        applyAction({ type: "inline", kind: "bold" });
+        applyTextAction({ type: "inline", kind: "bold" });
       } else if (!e.shiftKey && key === "i") {
         e.preventDefault();
         e.stopPropagation();
-        applyAction({ type: "inline", kind: "italic" });
+        applyTextAction({ type: "inline", kind: "italic" });
       } else if (!e.shiftKey && key === "e") {
         e.preventDefault();
         e.stopPropagation();
-        applyAction({ type: "inline", kind: "code" });
+        applyTextAction({ type: "inline", kind: "code" });
       } else if (e.shiftKey && key === "x") {
         e.preventDefault();
         e.stopPropagation();
-        applyAction({ type: "inline", kind: "strike" });
+        applyTextAction({ type: "inline", kind: "strike" });
       } else if (e.shiftKey && key === "h") {
         e.preventDefault();
         e.stopPropagation();
-        applyAction({ type: "highlight", color: "yellow" });
+        applyTextAction({ type: "highlight", color: "yellow" });
       }
     };
     document.addEventListener("keydown", onKeyDown, true);
     return () => document.removeEventListener("keydown", onKeyDown, true);
-  }, [readOnly, applyAction]);
+  }, [readOnly, applyTextAction]);
 
   if (readOnly) return null;
 
@@ -598,113 +848,120 @@ export default function TextStylePanel({
   const currentCjkObj = getCjkFontById(activeCjkFont);
   const standardFonts = CJK_FONTS.filter((f) => f.group === "standard");
   const handwritingFonts = CJK_FONTS.filter((f) => f.group === "handwriting");
+  const isDarkTheme = api?.getAppState()?.theme === "dark";
+
+  const canMerge = activeTable && currentRange ? canMergeRange(activeTable, currentRange) : false;
+  const canSplit = activeTable && currentRange ? canSplitRange(activeTable, currentRange) : false;
+  const anchorCell =
+    activeTable && currentRange
+      ? activeTable.rows[currentRange.r1]?.[currentRange.c1]
+      : null;
+  const activeColAlign =
+    activeTable && currentRange
+      ? activeTable.colAligns[currentRange.c1] || "left"
+      : "left";
 
   return (
     <>
-      {cjkHostEl &&
+      {/* 1. Compact Chinese font toggle button fused right inside Excalidraw's native Font row */}
+      {cjkBtnHostEl &&
         createPortal(
-          <fieldset className="md-style-panel md-cjk-panel">
-            <legend className="md-style-legend">
-              <span>{isZh ? "中文字体" : "Chinese font"}</span>
-              <span className="md-cjk-subnote">
-                {isZh ? "英文见上方" : "Latin above"}
-              </span>
-            </legend>
-
-            <div className="md-cjk-quick-grid">
-              {QUICK_CJK_FONT_IDS.map((fid) => {
-                const f = getCjkFontById(fid);
-                return (
-                  <button
-                    key={fid}
-                    type="button"
-                    className={`md-cjk-pill ${activeCjkFont === fid ? "active" : ""}`}
-                    title={isZh ? `${f.zh}（${f.tagZh}）` : `${f.en} (${f.tagEn})`}
-                    onMouseDown={preventBlur}
-                    onClick={() => applyCjkFont(fid)}
-                  >
-                    {isZh ? f.shortZh : f.shortEn}
-                  </button>
-                );
-              })}
-            </div>
-
-            <button
-              type="button"
-              className={`md-cjk-trigger ${cjkMenuOpen ? "open" : ""}`}
-              aria-expanded={cjkMenuOpen}
-              onMouseDown={preventBlur}
-              onClick={() => setCjkMenuOpen((v) => !v)}
-            >
-              <span
-                className="md-cjk-trigger-name"
-                style={{ fontFamily: currentCjkObj.stack }}
-              >
-                {isZh ? currentCjkObj.zh : currentCjkObj.en}
-              </span>
-              <span className="md-cjk-trigger-meta">
-                {isZh ? `全部 ${CJK_FONTS.length} 款` : `All ${CJK_FONTS.length}`}{" "}
-                {cjkMenuOpen ? "▴" : "▾"}
-              </span>
-            </button>
-
-            {cjkMenuOpen && (
-              <div className="md-cjk-list" role="listbox" aria-label={isZh ? "中文字体列表" : "Chinese fonts"}>
-                <div className="md-cjk-group-label">
-                  {isZh ? "常用中文字体" : "Standard"}
-                </div>
-                {standardFonts.map((f) => (
-                  <button
-                    key={f.id}
-                    type="button"
-                    role="option"
-                    aria-selected={activeCjkFont === f.id}
-                    className={`md-cjk-option ${activeCjkFont === f.id ? "active" : ""}`}
-                    onMouseDown={preventBlur}
-                    onClick={() => {
-                      applyCjkFont(f.id);
-                      setCjkMenuOpen(false);
-                    }}
-                  >
-                    <span className="md-cjk-opt-name" style={{ fontFamily: f.stack }}>
-                      {isZh ? f.zh : f.en}
-                    </span>
-                    <span className="md-cjk-opt-tag">
-                      {isZh ? f.tagZh : f.tagEn}
-                    </span>
-                  </button>
-                ))}
-
-                <div className="md-cjk-group-label">
-                  {isZh ? "中文手写体" : "Handwriting"}
-                </div>
-                {handwritingFonts.map((f) => (
-                  <button
-                    key={f.id}
-                    type="button"
-                    role="option"
-                    aria-selected={activeCjkFont === f.id}
-                    className={`md-cjk-option ${activeCjkFont === f.id ? "active" : ""}`}
-                    onMouseDown={preventBlur}
-                    onClick={() => {
-                      applyCjkFont(f.id);
-                      setCjkMenuOpen(false);
-                    }}
-                  >
-                    <span className="md-cjk-opt-name" style={{ fontFamily: f.stack }}>
-                      {isZh ? f.zh : f.en}
-                    </span>
-                    <span className="md-cjk-opt-tag">
-                      {isZh ? f.tagZh : f.tagEn}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </fieldset>,
-          cjkHostEl
+          <button
+            type="button"
+            className={`properties-trigger md-cjk-inline-btn ${
+              cjkPopover ? "active" : ""
+            } ${activeCjkFont !== "lxgw-wenkai" ? "has-custom" : ""}`}
+            title={
+              isZh
+                ? `中文字体：${currentCjkObj.zh}（点击切换，与英文字体独立）`
+                : `Chinese font: ${currentCjkObj.en} (independent from Latin font)`
+            }
+            aria-label={isZh ? "切换中文字体" : "Switch Chinese font"}
+            aria-expanded={Boolean(cjkPopover)}
+            onMouseDown={preventBlur}
+            onClick={(e) => toggleCjkPopover(e.currentTarget)}
+          >
+            <span>中</span>
+          </button>,
+          cjkBtnHostEl
         )}
 
+      {/* Floating Chinese Font Popover (anchored beside left panel, zero vertical clutter) */}
+      {cjkPopover &&
+        createPortal(
+          <div
+            ref={popoverRef}
+            className={`Island properties-content md-cjk-popover ${
+              isDarkTheme ? "is-dark" : ""
+            }`}
+            style={{ top: `${cjkPopover.top}px`, left: `${cjkPopover.left}px` }}
+            role="listbox"
+            aria-label={isZh ? "选择中文字体" : "Choose Chinese font"}
+            onMouseDown={preventBlur}
+          >
+            <div className="md-cjk-pop-head">
+              <span>{isZh ? "中文字体" : "Chinese font"}</span>
+              <span className="md-cjk-pop-sub">
+                {isZh ? "与英文字体独立" : "Independent CJK"}
+              </span>
+            </div>
+
+            <div className="md-cjk-pop-scroll">
+              <div className="md-cjk-group-label">
+                {isZh ? "常用中文字体" : "Standard"}
+              </div>
+              {standardFonts.map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  role="option"
+                  aria-selected={activeCjkFont === f.id}
+                  className={`md-cjk-option ${activeCjkFont === f.id ? "active" : ""}`}
+                  onMouseDown={preventBlur}
+                  onClick={() => {
+                    applyCjkFont(f.id);
+                    setCjkPopover(null);
+                  }}
+                >
+                  <span className="md-cjk-opt-name" style={{ fontFamily: f.stack }}>
+                    {isZh ? f.zh : f.en}
+                  </span>
+                  <span className="md-cjk-opt-tag">
+                    {isZh ? f.tagZh : f.tagEn}
+                  </span>
+                </button>
+              ))}
+
+              <div className="md-cjk-group-label">
+                {isZh ? "中文手写体" : "Handwriting"}
+              </div>
+              {handwritingFonts.map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  role="option"
+                  aria-selected={activeCjkFont === f.id}
+                  className={`md-cjk-option ${activeCjkFont === f.id ? "active" : ""}`}
+                  onMouseDown={preventBlur}
+                  onClick={() => {
+                    applyCjkFont(f.id);
+                    setCjkPopover(null);
+                  }}
+                >
+                  <span className="md-cjk-opt-name" style={{ fontFamily: f.stack }}>
+                    {isZh ? f.zh : f.en}
+                  </span>
+                  <span className="md-cjk-opt-tag">
+                    {isZh ? f.tagZh : f.tagEn}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>,
+          document.body
+        )}
+
+      {/* 2. Native Text Box Markdown & Rich-Text Controls */}
       {styleHostEl &&
         createPortal(
           <fieldset className="md-style-panel">
@@ -726,14 +983,13 @@ export default function TextStylePanel({
               </button>
             </legend>
 
-            {/* Block styles: H1, H2, H3, Bullet, Task, Quote */}
             <div className="md-style-btn-grid">
               <button
                 type="button"
                 className={`md-style-btn ${active.block === "h1" ? "active" : ""}`}
                 title={isZh ? "一级标题 (# )" : "Heading 1 (# )"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "block", kind: "h1" })}
+                onClick={() => applyTextAction({ type: "block", kind: "h1" })}
               >
                 H1
               </button>
@@ -742,7 +998,7 @@ export default function TextStylePanel({
                 className={`md-style-btn ${active.block === "h2" ? "active" : ""}`}
                 title={isZh ? "二级标题 (## )" : "Heading 2 (## )"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "block", kind: "h2" })}
+                onClick={() => applyTextAction({ type: "block", kind: "h2" })}
               >
                 H2
               </button>
@@ -751,7 +1007,7 @@ export default function TextStylePanel({
                 className={`md-style-btn ${active.block === "h3" ? "active" : ""}`}
                 title={isZh ? "三级标题 (### )" : "Heading 3 (### )"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "block", kind: "h3" })}
+                onClick={() => applyTextAction({ type: "block", kind: "h3" })}
               >
                 H3
               </button>
@@ -760,7 +1016,7 @@ export default function TextStylePanel({
                 className={`md-style-btn ${active.block === "bullet" ? "active" : ""}`}
                 title={isZh ? "无序列表 (- )" : "Bullet list (- )"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "block", kind: "bullet" })}
+                onClick={() => applyTextAction({ type: "block", kind: "bullet" })}
               >
                 •
               </button>
@@ -769,29 +1025,28 @@ export default function TextStylePanel({
                 className={`md-style-btn ${active.block === "task" ? "active" : ""}`}
                 title={isZh ? "待办清单 (- [ ] )" : "Checklist (- [ ] )"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "block", kind: "task" })}
+                onClick={() => applyTextAction({ type: "block", kind: "task" })}
               >
                 ☑
               </button>
               <button
                 type="button"
-                className={`md-style-btn ${active.block === "quote" ? "active" : ""}`}
-                title={isZh ? "引用 (> )" : "Quote (> )"}
+                className="md-style-btn"
+                title={isZh ? "插入 Markdown 表格" : "Insert Markdown table"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "block", kind: "quote" })}
+                onClick={() => applyTextAction({ type: "insert-md-table" })}
               >
-                ”
+                ⊞
               </button>
             </div>
 
-            {/* Inline styles: Bold, Italic, Strike, Code, Quick Highlight, Clear */}
             <div className="md-style-btn-grid">
               <button
                 type="button"
                 className={`md-style-btn ${active.bold ? "active" : ""}`}
                 title={isZh ? "加粗 **文字** (Ctrl+B)" : "Bold **text** (Ctrl+B)"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "inline", kind: "bold" })}
+                onClick={() => applyTextAction({ type: "inline", kind: "bold" })}
               >
                 <strong>B</strong>
               </button>
@@ -800,7 +1055,7 @@ export default function TextStylePanel({
                 className={`md-style-btn ${active.italic ? "active" : ""}`}
                 title={isZh ? "斜体 *文字* (Ctrl+I)" : "Italic *text* (Ctrl+I)"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "inline", kind: "italic" })}
+                onClick={() => applyTextAction({ type: "inline", kind: "italic" })}
               >
                 <em>I</em>
               </button>
@@ -813,7 +1068,7 @@ export default function TextStylePanel({
                     : "Strikethrough ~~text~~ (Ctrl+Shift+X)"
                 }
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "inline", kind: "strike" })}
+                onClick={() => applyTextAction({ type: "inline", kind: "strike" })}
               >
                 <span className="md-strike-icon">S</span>
               </button>
@@ -822,37 +1077,32 @@ export default function TextStylePanel({
                 className={`md-style-btn md-code-btn ${active.code ? "active" : ""}`}
                 title={isZh ? "行内代码 `code` (Ctrl+E)" : "Inline code `code` (Ctrl+E)"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "inline", kind: "code" })}
+                onClick={() => applyTextAction({ type: "inline", kind: "code" })}
               >
                 {"</>"}
               </button>
               <button
                 type="button"
-                className={`md-style-btn ${active.highlight === "yellow" ? "active" : ""}`}
-                title={
-                  isZh
-                    ? "荧光高亮 ==文字== (Ctrl+Shift+H)"
-                    : "Highlight ==text== (Ctrl+Shift+H)"
-                }
+                className={`md-style-btn ${active.block === "quote" ? "active" : ""}`}
+                title={isZh ? "引用 (> )" : "Quote (> )"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "highlight", color: "yellow" })}
+                onClick={() => applyTextAction({ type: "block", kind: "quote" })}
               >
-                <span className="md-hl-icon">A</span>
+                ”
               </button>
               <button
                 type="button"
                 className="md-style-btn"
                 title={isZh ? "清除富文本格式" : "Clear formatting"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "clear" })}
+                onClick={() => applyTextAction({ type: "clear" })}
               >
                 <span className="md-clear-icon">Tx</span>
               </button>
             </div>
 
-            {/* Partial Text Color Swatches */}
             <div className="md-style-sublabel">
-              {isZh ? "局部字体颜色" : "Inline text color"}
+              {isZh ? "局部字色" : "Inline text color"}
             </div>
             <div className="md-swatch-row">
               {TEXT_COLOR_PALETTE.map((c) => (
@@ -861,14 +1111,10 @@ export default function TextStylePanel({
                   type="button"
                   className={`md-swatch ${active.color === c.id ? "active" : ""}`}
                   style={{ "--swatch-color": c.hex }}
-                  title={
-                    isZh
-                      ? `局部${c.zh}色 ({c:${c.id}}文字{/c})`
-                      : `${c.en} text ({c:${c.id}}text{/c})`
-                  }
+                  title={isZh ? `局部${c.zh}色` : `${c.en} text`}
                   aria-label={isZh ? `局部${c.zh}色` : `${c.en} text`}
                   onMouseDown={preventBlur}
-                  onClick={() => applyAction({ type: "color", color: c.id })}
+                  onClick={() => applyTextAction({ type: "color", color: c.id })}
                 />
               ))}
               <button
@@ -877,15 +1123,14 @@ export default function TextStylePanel({
                 title={isZh ? "清除局部字色" : "Clear text color"}
                 aria-label={isZh ? "清除局部字色" : "Clear text color"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "color", color: null })}
+                onClick={() => applyTextAction({ type: "color", color: null })}
               >
                 ×
               </button>
             </div>
 
-            {/* Partial Highlight Color Swatches */}
             <div className="md-style-sublabel">
-              {isZh ? "局部高亮底色" : "Inline highlight"}
+              {isZh ? "局部高亮" : "Inline highlight"}
             </div>
             <div className="md-swatch-row">
               {HIGHLIGHT_COLOR_PALETTE.map((c) => (
@@ -894,18 +1139,10 @@ export default function TextStylePanel({
                   type="button"
                   className={`md-swatch md-swatch-hl ${active.highlight === c.id ? "active" : ""}`}
                   style={{ "--swatch-color": c.swatch }}
-                  title={
-                    isZh
-                      ? c.id === "yellow"
-                        ? `${c.zh} (==文字==)`
-                        : `${c.zh} ({bg:${c.id}}文字{/bg})`
-                      : c.id === "yellow"
-                        ? `${c.en} (==text==)`
-                        : `${c.en} ({bg:${c.id}}text{/bg})`
-                  }
+                  title={isZh ? c.zh : c.en}
                   aria-label={isZh ? c.zh : c.en}
                   onMouseDown={preventBlur}
-                  onClick={() => applyAction({ type: "highlight", color: c.id })}
+                  onClick={() => applyTextAction({ type: "highlight", color: c.id })}
                 />
               ))}
               <button
@@ -914,23 +1151,353 @@ export default function TextStylePanel({
                 title={isZh ? "清除局部高亮" : "Clear highlight"}
                 aria-label={isZh ? "清除局部高亮" : "Clear highlight"}
                 onMouseDown={preventBlur}
-                onClick={() => applyAction({ type: "highlight", color: null })}
+                onClick={() => applyTextAction({ type: "highlight", color: null })}
+              >
+                ×
+              </button>
+            </div>
+
+            {isEditingText && (
+              <div className="md-style-hint">
+                {isZh ? "拖选部分文字可单独改色/高亮" : "Select text to color or highlight"}
+              </div>
+            )}
+          </fieldset>,
+          styleHostEl
+        )}
+
+      {/* 3. Left-Panel Table Structure, Merge/Split & Cell Styling (replaces bulky card toolbar!) */}
+      {tableHostEl &&
+        activeTable &&
+        currentRange &&
+        createPortal(
+          <fieldset className="md-style-panel md-table-panel">
+            <legend className="md-style-legend">
+              <span>
+                {isZh ? "表格" : "Table"}{" "}
+                <small className="md-tbl-dim">
+                  {activeTable.rows.length}×{activeTable.colWidths.length}
+                </small>
+              </span>
+              <button
+                type="button"
+                className="md-style-switch"
+                title={isZh ? "复制为 Markdown 表格" : "Copy as Markdown table"}
+                onMouseDown={preventBlur}
+                onClick={async () => {
+                  const md = tableToMarkdown(activeTable);
+                  try {
+                    await navigator.clipboard.writeText(md);
+                  } catch {}
+                  setCopiedTableMd(true);
+                  setTimeout(() => setCopiedTableMd(false), 1600);
+                }}
+              >
+                {copiedTableMd ? (isZh ? "已复制" : "Copied") : "MD"}
+              </button>
+            </legend>
+
+            {/* Row / Column Structure */}
+            <div className="md-tbl-grid-4">
+              <button
+                type="button"
+                className="md-style-btn"
+                title={isZh ? "在下方插入行" : "Insert row below"}
+                onMouseDown={preventBlur}
+                onClick={() => {
+                  const next = insertRowAt(activeTable, currentRange.r2 + 1);
+                  commitTable(next, {
+                    r1: currentRange.r2 + 1,
+                    c1: currentRange.c1,
+                    r2: currentRange.r2 + 1,
+                    c2: currentRange.c1,
+                  });
+                }}
+              >
+                {isZh ? "+行" : "+Row"}
+              </button>
+              <button
+                type="button"
+                className="md-style-btn md-btn-danger"
+                disabled={activeTable.rows.length <= 1}
+                title={isZh ? "删除当前行" : "Delete current row"}
+                onMouseDown={preventBlur}
+                onClick={() => {
+                  const next = deleteRowAt(activeTable, currentRange.r1);
+                  const r = Math.min(currentRange.r1, next.rows.length - 1);
+                  commitTable(next, { r1: r, c1: currentRange.c1, r2: r, c2: currentRange.c1 });
+                }}
+              >
+                {isZh ? "-行" : "-Row"}
+              </button>
+              <button
+                type="button"
+                className="md-style-btn"
+                title={isZh ? "在右侧插入列" : "Insert column right"}
+                onMouseDown={preventBlur}
+                onClick={() => {
+                  const colIdx = currentRange.c2 + 1;
+                  const next = insertColAt(
+                    activeTable,
+                    colIdx,
+                    isZh ? `列 ${colIdx + 1}` : `Col ${colIdx + 1}`
+                  );
+                  commitTable(next, {
+                    r1: currentRange.r1,
+                    c1: colIdx,
+                    r2: currentRange.r1,
+                    c2: colIdx,
+                  });
+                }}
+              >
+                {isZh ? "+列" : "+Col"}
+              </button>
+              <button
+                type="button"
+                className="md-style-btn md-btn-danger"
+                disabled={activeTable.colWidths.length <= 1}
+                title={isZh ? "删除当前列" : "Delete current column"}
+                onMouseDown={preventBlur}
+                onClick={() => {
+                  const next = deleteColAt(activeTable, currentRange.c1);
+                  const c = Math.min(currentRange.c1, next.colWidths.length - 1);
+                  commitTable(next, { r1: currentRange.r1, c1: c, r2: currentRange.r1, c2: c });
+                }}
+              >
+                {isZh ? "-列" : "-Col"}
+              </button>
+            </div>
+
+            {/* Merge / Split Cells (Feishu-style) */}
+            <div className="md-tbl-grid-2">
+              <button
+                type="button"
+                className={`md-style-btn ${canMerge ? "md-btn-accent" : ""}`}
+                disabled={!canMerge}
+                title={
+                  isZh
+                    ? "合并框选的多个单元格 (Ctrl+Shift+M)"
+                    : "Merge selected cells (Ctrl+Shift+M)"
+                }
+                onMouseDown={preventBlur}
+                onClick={() => {
+                  const next = mergeCells(activeTable, currentRange);
+                  commitTable(next, {
+                    r1: currentRange.r1,
+                    c1: currentRange.c1,
+                    r2: currentRange.r1,
+                    c2: currentRange.c1,
+                  });
+                }}
+              >
+                {isZh ? "合并单元格" : "Merge"}
+              </button>
+              <button
+                type="button"
+                className={`md-style-btn ${canSplit ? "md-btn-accent" : ""}`}
+                disabled={!canSplit}
+                title={
+                  isZh
+                    ? "拆分已合并的单元格 (Ctrl+Shift+M)"
+                    : "Split merged cell (Ctrl+Shift+M)"
+                }
+                onMouseDown={preventBlur}
+                onClick={() => {
+                  const next = splitCells(activeTable, currentRange);
+                  commitTable(next, currentRange);
+                }}
+              >
+                {isZh ? "拆分单元格" : "Split"}
+              </button>
+            </div>
+
+            {/* Header / Stripe / Alignment */}
+            <div className="md-tbl-grid-5">
+              <button
+                type="button"
+                className={`md-style-btn ${activeTable.headerRow ? "active" : ""}`}
+                title={isZh ? "首行作为表头" : "Header row"}
+                onMouseDown={preventBlur}
+                onClick={() =>
+                  commitTable({ ...activeTable, headerRow: !activeTable.headerRow })
+                }
+              >
+                {isZh ? "表头" : "Head"}
+              </button>
+              <button
+                type="button"
+                className={`md-style-btn ${activeTable.striped ? "active" : ""}`}
+                title={isZh ? "隔行斑马纹" : "Striped rows"}
+                onMouseDown={preventBlur}
+                onClick={() =>
+                  commitTable({ ...activeTable, striped: !activeTable.striped })
+                }
+              >
+                {isZh ? "斑马" : "Alt"}
+              </button>
+              {[
+                { id: "left", zh: "左", en: "L" },
+                { id: "center", zh: "中", en: "C" },
+                { id: "right", zh: "右", en: "R" },
+              ].map((a) => (
+                <button
+                  key={a.id}
+                  type="button"
+                  className={`md-style-btn ${activeColAlign === a.id ? "active" : ""}`}
+                  title={isZh ? `列${a.zh}对齐` : `Align ${a.id}`}
+                  onMouseDown={preventBlur}
+                  onClick={() => {
+                    const nextAligns = activeTable.colAligns.map((cur, ci) =>
+                      ci >= currentRange.c1 && ci <= currentRange.c2 ? a.id : cur
+                    );
+                    commitTable({ ...activeTable, colAligns: nextAligns });
+                  }}
+                >
+                  {isZh ? a.zh : a.en}
+                </button>
+              ))}
+            </div>
+
+            {/* Table Chinese Font */}
+            <button
+              type="button"
+              className="properties-trigger md-cjk-table-trigger"
+              onMouseDown={preventBlur}
+              onClick={(e) => toggleCjkPopover(e.currentTarget)}
+            >
+              <span>{isZh ? "中文字体" : "CJK font"}</span>
+              <span
+                className="md-cjk-table-val"
+                style={{ fontFamily: currentCjkObj.stack }}
+              >
+                {isZh ? currentCjkObj.zh : currentCjkObj.en} ▾
+              </span>
+            </button>
+
+            {/* Cell Markdown Quick Formatting */}
+            <div className="md-style-sublabel">
+              {isZh ? "单元格 Markdown" : "Cell Markdown"}
+            </div>
+            <div className="md-style-btn-grid">
+              <button
+                type="button"
+                className="md-style-btn"
+                title={isZh ? "加粗 **文字**" : "Bold"}
+                onMouseDown={preventBlur}
+                onClick={() => applyTableCellMarkdown({ type: "inline", kind: "bold" })}
+              >
+                <strong>B</strong>
+              </button>
+              <button
+                type="button"
+                className="md-style-btn"
+                title={isZh ? "斜体 *文字*" : "Italic"}
+                onMouseDown={preventBlur}
+                onClick={() => applyTableCellMarkdown({ type: "inline", kind: "italic" })}
+              >
+                <em>I</em>
+              </button>
+              <button
+                type="button"
+                className="md-style-btn"
+                title={isZh ? "删除线 ~~文字~~" : "Strikethrough"}
+                onMouseDown={preventBlur}
+                onClick={() => applyTableCellMarkdown({ type: "inline", kind: "strike" })}
+              >
+                <span className="md-strike-icon">S</span>
+              </button>
+              <button
+                type="button"
+                className="md-style-btn md-code-btn"
+                title={isZh ? "行内代码 `code`" : "Code"}
+                onMouseDown={preventBlur}
+                onClick={() => applyTableCellMarkdown({ type: "inline", kind: "code" })}
+              >
+                {"</>"}
+              </button>
+              <button
+                type="button"
+                className="md-style-btn"
+                title={isZh ? "荧光高亮 ==文字==" : "Highlight"}
+                onMouseDown={preventBlur}
+                onClick={() =>
+                  applyTableCellMarkdown({ type: "highlight", color: "yellow" })
+                }
+              >
+                <span className="md-hl-icon">A</span>
+              </button>
+              <button
+                type="button"
+                className="md-style-btn"
+                title={isZh ? "待办清单 - [ ]" : "Checklist"}
+                onMouseDown={preventBlur}
+                onClick={() => applyTableCellMarkdown({ type: "block", kind: "task" })}
+              >
+                ☑
+              </button>
+            </div>
+
+            {/* Cell Fill Color */}
+            <div className="md-style-sublabel">
+              {isZh ? "单元格底色" : "Cell fill"}
+            </div>
+            <div className="md-swatch-row md-swatch-row-7">
+              {TABLE_CELL_BG_PALETTE.filter((c) => c.id !== null).map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  className={`md-swatch ${anchorCell?.bg === c.id ? "active" : ""}`}
+                  style={{ "--swatch-color": c.swatch }}
+                  title={isZh ? `单元格${c.zh}色底` : `${c.en} fill`}
+                  onMouseDown={preventBlur}
+                  onClick={() => patchSelectedTableCells({ bg: c.id })}
+                />
+              ))}
+              <button
+                type="button"
+                className="md-swatch md-swatch-clear"
+                title={isZh ? "清除单元格底色" : "Clear fill"}
+                onMouseDown={preventBlur}
+                onClick={() => patchSelectedTableCells({ bg: null })}
+              >
+                ×
+              </button>
+            </div>
+
+            {/* Cell Text Color */}
+            <div className="md-style-sublabel">
+              {isZh ? "单元格字色" : "Cell text"}
+            </div>
+            <div className="md-swatch-row md-swatch-row-7">
+              {TABLE_CELL_TEXT_PALETTE.filter((c) => c.id !== null).map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  className={`md-swatch ${anchorCell?.color === c.id ? "active" : ""}`}
+                  style={{ "--swatch-color": c.swatch }}
+                  title={isZh ? `单元格${c.zh}字` : `${c.en} text`}
+                  onMouseDown={preventBlur}
+                  onClick={() => patchSelectedTableCells({ color: c.id })}
+                />
+              ))}
+              <button
+                type="button"
+                className="md-swatch md-swatch-clear"
+                title={isZh ? "清除单元格字色" : "Clear text color"}
+                onMouseDown={preventBlur}
+                onClick={() => patchSelectedTableCells({ color: null })}
               >
                 ×
               </button>
             </div>
 
             <div className="md-style-hint">
-              {isEditingText
-                ? isZh
-                  ? "已进入编辑：拖选部分文字可单独改色或高亮"
-                  : "Editing: select any text to style or color it"
-                : isZh
-                  ? "双击选中部分文字可局部改色/高亮"
-                  : "Double-click & select text for partial color"}
+              {isZh
+                ? "拖选多格可合并 · 单元格支持完整 Markdown"
+                : "Drag cells to merge · Markdown supported"}
             </div>
           </fieldset>,
-          styleHostEl
+          tableHostEl
         )}
     </>
   );
