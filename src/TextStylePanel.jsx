@@ -100,6 +100,7 @@ function getTargetTextElements(api) {
 }
 
 const BLANK_MD_TABLE = "|  |  |  |\n| --- | --- | --- |\n|  |  |  |\n|  |  |  |";
+const BLANK_CODE_BLOCK = "```javascript\n\n```";
 
 function getSelectedNativeMdTableOverlay(api, nativeMd) {
   if (!api || !nativeMd) return null;
@@ -691,7 +692,20 @@ export default function TextStylePanel({
         const clampedEnd = Math.max(clampedStart, Math.min(end, ta.value.length));
 
         let res;
-        if (action.type === "insert-md-table") {
+        if (action.type === "insert-codeblock") {
+          const tpl = BLANK_CODE_BLOCK;
+          const before = ta.value.slice(0, clampedStart);
+          const after = ta.value.slice(clampedEnd);
+          const prefixNl = before && !before.endsWith("\n") ? "\n" : "";
+          const suffixNl = after && !after.startsWith("\n") ? "\n" : "";
+          const inserted = `${prefixNl}${tpl}${suffixNl}`;
+          const caret = clampedStart + prefixNl.length + "```javascript\n".length;
+          res = {
+            text: before + inserted + after,
+            start: caret,
+            end: caret,
+          };
+        } else if (action.type === "insert-md-table") {
           const tpl = BLANK_MD_TABLE;
           const before = ta.value.slice(0, clampedStart);
           const after = ta.value.slice(clampedEnd);
@@ -753,7 +767,11 @@ export default function TextStylePanel({
         if (!targetIds.has(el.id) || el.isDeleted) return el;
         const currentRaw = el.originalText ?? el.text ?? "";
         let nextRaw;
-        if (action.type === "insert-md-table") {
+        if (action.type === "insert-codeblock") {
+          nextRaw = currentRaw.trim()
+            ? `${currentRaw}\n${BLANK_CODE_BLOCK}`
+            : BLANK_CODE_BLOCK;
+        } else if (action.type === "insert-md-table") {
           nextRaw = currentRaw.trim()
             ? `${currentRaw}\n${BLANK_MD_TABLE}`
             : BLANK_MD_TABLE;
@@ -1202,12 +1220,12 @@ export default function TextStylePanel({
               </button>
               <button
                 type="button"
-                className="md-style-btn"
-                title={isZh ? "插入 Markdown 表格" : "Insert Markdown table"}
+                className={`md-style-btn ${active.block === "quote" ? "active" : ""}`}
+                title={isZh ? "引用 (> )" : "Quote (> )"}
                 onMouseDown={preventBlur}
-                onClick={() => applyTextAction({ type: "insert-md-table" })}
+                onClick={() => applyTextAction({ type: "block", kind: "quote" })}
               >
-                ⊞
+                ”
               </button>
             </div>
 
@@ -1250,16 +1268,16 @@ export default function TextStylePanel({
                 onMouseDown={preventBlur}
                 onClick={() => applyTextAction({ type: "inline", kind: "code" })}
               >
-                {"</>"}
+                {"`c`"}
               </button>
               <button
                 type="button"
-                className={`md-style-btn ${active.block === "quote" ? "active" : ""}`}
-                title={isZh ? "引用 (> )" : "Quote (> )"}
+                className={`md-style-btn ${active.highlight === "yellow" ? "active" : ""}`}
+                title={isZh ? "荧光高亮 ==文字== (Ctrl+Shift+H)" : "Highlight ==text== (Ctrl+Shift+H)"}
                 onMouseDown={preventBlur}
-                onClick={() => applyTextAction({ type: "block", kind: "quote" })}
+                onClick={() => applyTextAction({ type: "highlight", color: "yellow" })}
               >
-                ”
+                <span className="md-hl-icon">A</span>
               </button>
               <button
                 type="button"
@@ -1269,6 +1287,27 @@ export default function TextStylePanel({
                 onClick={() => applyTextAction({ type: "clear" })}
               >
                 <span className="md-clear-icon">Tx</span>
+              </button>
+            </div>
+
+            <div className="md-tbl-grid-2">
+              <button
+                type="button"
+                className="md-style-btn"
+                title={isZh ? "插入 Markdown 表格" : "Insert Markdown table"}
+                onMouseDown={preventBlur}
+                onClick={() => applyTextAction({ type: "insert-md-table" })}
+              >
+                {isZh ? "⊞ 表格" : "⊞ Table"}
+              </button>
+              <button
+                type="button"
+                className="md-style-btn"
+                title={isZh ? "插入语法高亮代码块 (```)" : "Insert syntax-highlighted code block (```)"}
+                onMouseDown={preventBlur}
+                onClick={() => applyTextAction({ type: "insert-codeblock" })}
+              >
+                {isZh ? "</> 代码块" : "</> Code"}
               </button>
             </div>
 

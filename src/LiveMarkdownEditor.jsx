@@ -1,15 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { normalizeCodeLang } from "./codeHighlight";
 import {
   appendColToLiveTable,
   appendRowToLiveTable,
   applyDomRichAction,
+  buildLiveCodeBlockHtml,
   detectActiveDomFormats,
   domToMarkdown,
+  focusCodeBlockInput,
   getClosestCellEl,
   getClosestLineEl,
   markdownToHtml,
   placeCaretIn,
+  readCodeBlockValue,
+  renderCodePreHtml,
   setLineBlockType,
   tryLiveMarkdownRule,
 } from "./richMarkdownDom";
@@ -103,6 +108,8 @@ export default function LiveMarkdownEditor({
   const savedExpandedRangeRef = useRef(null);
   const tableOuterBorderRef = useRef(true);
   const taRef = useRef(null);
+  const hydratedTaRef = useRef(null);
+  const suppressEnterUntilRef = useRef(0);
   const onFormatsChangeRef = useRef(onFormatsChange);
   onFormatsChangeRef.current = onFormatsChange;
   const isZhRef = useRef(isZh);
@@ -165,7 +172,10 @@ export default function LiveMarkdownEditor({
   const syncToTextarea = useCallback(() => {
     const ta = taRef.current;
     const editor = editorRef.current;
-    if (!ta || !editor) return "";
+    // Hard guard: never write to ta.value unless this exact textarea has been hydrated
+    if (!ta || !editor || hydratedTaRef.current !== ta) {
+      return ta?.value ?? "";
+    }
     const md = domToMarkdown(editor);
     if (ta.value !== md) {
       ta.value = md;
@@ -191,14 +201,16 @@ export default function LiveMarkdownEditor({
 
   const emitFormats = useCallback(() => {
     const editor = editorRef.current;
-    if (!editor) return;
+    const ta = taRef.current;
+    if (!editor || hydratedTaRef.current !== ta) return;
     onFormatsChangeRef.current?.(detectActiveDomFormats(editor), domToMarkdown(editor));
   }, []);
 
-  // Attach to active textarea ONCE per textarea instance: hide raw textarea, mirror style, hydrate live DOM, focus
-  useEffect(() => {
+  // Synchronously hydrate live DOM right when taEl mounts (zero RAF race, never clears existing text!)
+  useLayoutEffect(() => {
     taRef.current = taEl;
     if (!taEl) {
+      hydratedTaRef.current = null;
       setMirrorStyle(null);
       if (globalThis.__EXCALIDRAW_LIVE_EDITOR__) {
         globalThis.__EXCALIDRAW_LIVE_EDITOR__ = null;
@@ -217,25 +229,30 @@ export default function LiveMarkdownEditor({
     const editingEl = getEditingElement(apiRef.current);
     tableOuterBorderRef.current = editingEl?.customData?.tableOuterBorder !== false;
 
-    // Hydrate editor DOM once when this textarea mounts (never re-hydrate while typing!)
-    const rafId = requestAnimationFrame(() => {
-      const editor = editorRef.current;
-      if (!editor) return;
-      editor.innerHTML = markdownToHtml(taEl.value, {
+    const editor = editorRef.current;
+    if (editor && hydratedTaRef.current !== taEl) {
+      const initialText = taEl.value ?? editingEl?.originalText ?? editingEl?.text ?? "";
+      editor.innerHTML = markdownToHtml(initialText, {
         tableOuterBorder: tableOuterBorderRef.current,
         isZh: isZhRef.current,
       });
-      editor.focus({ preventScroll: true });
+      hydratedTaRef.current = taEl;
 
-      const firstTableCell =
-        editor.children.length === 1 &&
-        editor.firstElementChild?.getAttribute("data-md-table") === "1"
-          ? editor.querySelector("th, td")
+      const singleChild = editor.children.length === 1 ? editor.firstElementChild : null;
+      const singleCodeWrap =
+        singleChild?.getAttribute("data-md-codeblock") === "1" ? singleChild : null;
+      const singleTableCell =
+        singleChild?.getAttribute("data-md-table") === "1"
+          ? singleChild.querySelector("th, td")
           : null;
 
-      if (firstTableCell) {
-        placeCaretIn(firstTableCell, false);
+      if (singleCodeWrap) {
+        focusCodeBlockInput(singleCodeWrap, true);
+      } else if (singleTableCell) {
+        editor.focus({ preventScroll: true });
+        placeCaretIn(singleTableCell, false);
       } else {
+        editor.focus({ preventScroll: true });
         const lastLine = editor.querySelector(":scope > .md-live-line:last-of-type");
         const target =
           lastLine?.getAttribute("data-block") === "task"
@@ -244,12 +261,12 @@ export default function LiveMarkdownEditor({
         placeCaretIn(target, false);
       }
       emitFormats();
-    });
+    }
 
     return () => {
-      cancelAnimationFrame(rafId);
       styleObs.disconnect();
       taEl.classList.remove("md-live-hidden-ta");
+      hydratedTaRef.current = null;
       if (document.contains(taEl) && !globalThis.__EXCALIDRAW_MD__?.liveEdit) {
         taEl.focus();
       }
@@ -261,7 +278,7 @@ export default function LiveMarkdownEditor({
     if (!taEl) return;
     const onSel = () => {
       const editor = editorRef.current;
-      if (!editor) return;
+      if (!editor || hydratedTaRef.current !== taRef.current) return;
       const sel = window.getSelection();
       if (
         sel &&
@@ -272,8 +289,10 @@ export default function LiveMarkdownEditor({
         savedRangeRef.current = cloned;
         if (!cloned.collapsed) {
           savedExpandedRangeRef.current = cloned.cloneRange();
-        } else if (document.activeElement === editor) {
-          // Only clear expanded range when user actively collapsed caret inside the editor
+        } else if (
+          document.activeElement === editor ||
+          editor.contains(document.activeElement)
+        ) {
           savedExpandedRangeRef.current = null;
         }
         emitFormats();
@@ -296,18 +315,14 @@ export default function LiveMarkdownEditor({
           ".App-menu__left, .App-mobile-menu, .properties-content, .properties-trigger, .md-cjk-popover, .zoom-actions, .undo-redo-buttons"
         )
       ) {
-        // Don't disturb active selection when clicking left-panel style controls
         return;
       }
 
-      // Always flush latest markdown before Excalidraw's own canvas handler runs
       syncToTextarea();
 
       if (target instanceof HTMLCanvasElement) {
-        // Excalidraw's own M handler commits cleanly on canvas click
         return;
       }
-      // Clicking other topbar / unrelated UI commits cleanly
       commitAndExit();
     };
 
@@ -318,9 +333,9 @@ export default function LiveMarkdownEditor({
   const applyAction = useCallback(
     (action) => {
       const editor = editorRef.current;
-      if (!editor) return false;
+      if (!editor || hydratedTaRef.current !== taRef.current) return false;
 
-      // Capture active selection BEFORE calling editor.focus() so focus changes can't collapse it
+      // Capture active selection BEFORE focusing so focus changes can't collapse it
       const selBefore = window.getSelection();
       let preferredRange = null;
       if (
@@ -359,7 +374,7 @@ export default function LiveMarkdownEditor({
       const changed = applyDomRichAction(editor, action, {
         savedRange: preferredRange,
         tableOuterBorder: tableOuterBorderRef.current,
-        isZh,
+        isZh: isZhRef.current,
       });
       if (changed) {
         syncToTextarea();
@@ -371,13 +386,15 @@ export default function LiveMarkdownEditor({
         ) {
           const nextCloned = sel.getRangeAt(0).cloneRange();
           savedRangeRef.current = nextCloned;
-          savedExpandedRangeRef.current = nextCloned.collapsed ? null : nextCloned.cloneRange();
+          savedExpandedRangeRef.current = nextCloned.collapsed
+            ? null
+            : nextCloned.cloneRange();
         }
         emitFormats();
       }
       return changed;
     },
-    [isZh, syncToTextarea, emitFormats]
+    [syncToTextarea, emitFormats]
   );
 
   // Register global bridge so TextStylePanel can invoke live rich commands directly
@@ -389,7 +406,10 @@ export default function LiveMarkdownEditor({
     const bridge = {
       applyAction,
       getActiveFormats: () => detectActiveDomFormats(editorRef.current),
-      getMarkdown: () => domToMarkdown(editorRef.current),
+      getMarkdown: () =>
+        hydratedTaRef.current === taRef.current
+          ? domToMarkdown(editorRef.current)
+          : taRef.current?.value ?? "",
       setTableOuterBorder: (showOuter) => {
         tableOuterBorderRef.current = Boolean(showOuter);
         const editor = editorRef.current;
@@ -409,21 +429,194 @@ export default function LiveMarkdownEditor({
     };
   }, [taEl, applyAction, commitAndExit]);
 
-  const handleInput = useCallback(() => {
-    const editor = editorRef.current;
-    if (!editor) return;
-    if (composingRef.current) return;
+  // Native DOM event delegation for innerHTML-mounted code block <select> & <textarea> controls
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!taEl || !root) return;
 
-    // Ensure root always has at least one block child
-    if (editor.childNodes.length === 0) {
-      editor.innerHTML = `<div class="md-live-line" data-block="normal"><br></div>`;
-      placeCaretIn(editor.firstElementChild, true);
-    }
+    const updatePreFromInput = (inputEl) => {
+      const wrap = inputEl.closest('[data-md-codeblock="1"]');
+      const pre = wrap?.querySelector('[data-cb-pre="1"]');
+      const lang = wrap?.getAttribute("data-lang") || "javascript";
+      if (pre) {
+        pre.innerHTML = renderCodePreHtml(inputEl.value, lang);
+      }
+      syncToTextarea();
+    };
 
-    tryLiveMarkdownRule(editor);
-    syncToTextarea();
-    emitFormats();
-  }, [syncToTextarea, emitFormats]);
+    const onNativeInput = (e) => {
+      const target = e.target;
+      if (target instanceof HTMLTextAreaElement && target.getAttribute("data-cb-input") === "1") {
+        e.stopPropagation();
+        updatePreFromInput(target);
+      }
+    };
+
+    const onNativeChange = (e) => {
+      const target = e.target;
+      if (target instanceof HTMLSelectElement && target.getAttribute("data-cb-lang") === "1") {
+        e.stopPropagation();
+        const wrap = target.closest('[data-md-codeblock="1"]');
+        if (!wrap) return;
+        const nextLang = normalizeCodeLang(target.value);
+        wrap.setAttribute("data-lang", nextLang);
+        const input = wrap.querySelector('[data-cb-input="1"]');
+        const pre = wrap.querySelector('[data-cb-pre="1"]');
+        if (pre && input) {
+          pre.innerHTML = renderCodePreHtml(input.value, nextLang);
+        }
+        syncToTextarea();
+        emitFormats();
+      }
+    };
+
+    const onNativeKeyDown = (e) => {
+      const target = e.target;
+      if (!(target instanceof HTMLTextAreaElement) || target.getAttribute("data-cb-input") !== "1") {
+        return;
+      }
+
+      if (e.key === "Escape" || (e.key === "Enter" && (e.ctrlKey || e.metaKey))) {
+        if (e.isComposing || e.keyCode === 229) return;
+        e.preventDefault();
+        e.stopPropagation();
+        commitAndExit();
+        return;
+      }
+
+      e.stopPropagation();
+      if (e.isComposing || e.keyCode === 229) return;
+
+      const wrap = target.closest('[data-md-codeblock="1"]');
+      const editor = editorRef.current;
+
+      if (e.key === "Tab") {
+        e.preventDefault();
+        const s = target.selectionStart ?? 0;
+        const end = target.selectionEnd ?? s;
+        target.value = `${target.value.slice(0, s)}  ${target.value.slice(end)}`;
+        target.setSelectionRange(s + 2, s + 2);
+        updatePreFromInput(target);
+        return;
+      }
+
+      if (e.key === "Enter" && e.shiftKey) {
+        e.preventDefault();
+        if (wrap && editor && wrap.parentElement === editor) {
+          const { lineEl, caretTarget } = makeLineDiv("normal");
+          wrap.insertAdjacentElement("afterend", lineEl);
+          editor.focus({ preventScroll: true });
+          placeCaretIn(caretTarget, true);
+          syncToTextarea();
+          emitFormats();
+        }
+        return;
+      }
+
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        suppressEnterUntilRef.current = performance.now() + 80;
+        const s = target.selectionStart ?? 0;
+        const end = target.selectionEnd ?? s;
+        const before = target.value.slice(0, s);
+        const lineStart = before.lastIndexOf("\n") + 1;
+        const curLine = before.slice(lineStart);
+        const indentMatch = curLine.match(/^(\s*)/);
+        let indent = indentMatch ? indentMatch[1] : "";
+        const trimmedEnd = curLine.trimEnd();
+        if (trimmedEnd.endsWith("{") || trimmedEnd.endsWith(":")) {
+          indent += "  ";
+        }
+        const insert = `\n${indent}`;
+        target.value = `${before}${insert}${target.value.slice(end)}`;
+        const nextPos = s + insert.length;
+        target.setSelectionRange(nextPos, nextPos);
+        updatePreFromInput(target);
+        return;
+      }
+
+      if (e.key === "Backspace" && target.value.length === 0) {
+        if (wrap && editor && wrap.parentElement === editor) {
+          e.preventDefault();
+          const { lineEl, caretTarget } = makeLineDiv("normal");
+          editor.replaceChild(lineEl, wrap);
+          editor.focus({ preventScroll: true });
+          placeCaretIn(caretTarget, true);
+          syncToTextarea();
+          emitFormats();
+        }
+      }
+    };
+
+    const onNativeBeforeInput = (e) => {
+      const target = e.target;
+      if (
+        performance.now() < suppressEnterUntilRef.current &&
+        target instanceof HTMLTextAreaElement &&
+        target.getAttribute("data-cb-input") === "1" &&
+        (e.inputType === "insertLineBreak" ||
+          e.inputType === "insertParagraph" ||
+          e.data === "\n" ||
+          e.data === "\r")
+      ) {
+        suppressEnterUntilRef.current = 0;
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+
+    const onNativeKeyPress = (e) => {
+      if (
+        performance.now() < suppressEnterUntilRef.current &&
+        (e.key === "Enter" || e.charCode === 13)
+      ) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+
+    const onNativeKeyUp = (e) => {
+      if (e.key === "Enter") {
+        suppressEnterUntilRef.current = 0;
+      }
+    };
+
+    root.addEventListener("input", onNativeInput, true);
+    root.addEventListener("change", onNativeChange, true);
+    root.addEventListener("keydown", onNativeKeyDown, true);
+    root.addEventListener("beforeinput", onNativeBeforeInput, true);
+    root.addEventListener("keypress", onNativeKeyPress, true);
+    root.addEventListener("keyup", onNativeKeyUp, true);
+    return () => {
+      root.removeEventListener("input", onNativeInput, true);
+      root.removeEventListener("change", onNativeChange, true);
+      root.removeEventListener("keydown", onNativeKeyDown, true);
+      root.removeEventListener("beforeinput", onNativeBeforeInput, true);
+      root.removeEventListener("keypress", onNativeKeyPress, true);
+      root.removeEventListener("keyup", onNativeKeyUp, true);
+    };
+  }, [taEl, syncToTextarea, commitAndExit, emitFormats]);
+
+  const handleInput = useCallback(
+    (e) => {
+      const editor = editorRef.current;
+      if (!editor || hydratedTaRef.current !== taRef.current) return;
+      if (composingRef.current) return;
+      if (e?.target instanceof HTMLTextAreaElement && e.target.getAttribute("data-cb-input") === "1") {
+        return;
+      }
+
+      if (editor.childNodes.length === 0) {
+        editor.innerHTML = `<div class="md-live-line" data-block="normal"><br></div>`;
+        placeCaretIn(editor.firstElementChild, true);
+      }
+
+      tryLiveMarkdownRule(editor);
+      syncToTextarea();
+      emitFormats();
+    },
+    [syncToTextarea, emitFormats]
+  );
 
   const handleKeyDown = useCallback(
     (e) => {
@@ -446,7 +639,12 @@ export default function LiveMarkdownEditor({
         return;
       }
 
-      // Rich-text keyboard shortcuts
+      // Code block textarea keydowns are handled directly by native capture listener
+      if (e.target instanceof HTMLTextAreaElement && e.target.getAttribute("data-cb-input") === "1") {
+        return;
+      }
+
+      // 2. Rich-text keyboard shortcuts
       if ((e.ctrlKey || e.metaKey) && !e.altKey) {
         const key = e.key.toLowerCase();
         if (!e.shiftKey && key === "b") {
@@ -480,7 +678,7 @@ export default function LiveMarkdownEditor({
       if (!sel || !sel.rangeCount) return;
       const range = sel.getRangeAt(0);
 
-      // Inside a live Markdown table cell
+      // 3. Inside a live Markdown table cell
       const cellEl = getClosestCellEl(range.startContainer, editor);
       if (cellEl) {
         const tr = cellEl.parentElement;
@@ -542,7 +740,6 @@ export default function LiveMarkdownEditor({
           return;
         }
 
-        // Prevent deleting the cell node when Backspace/Delete is pressed in an empty cell
         if (
           (e.key === "Backspace" || e.key === "Delete") &&
           range.collapsed &&
@@ -554,7 +751,7 @@ export default function LiveMarkdownEditor({
         return;
       }
 
-      // Inside a regular/heading/list/task .md-live-line
+      // 4. Inside a regular/heading/list/task .md-live-line
       const lineEl = getClosestLineEl(range.startContainer, editor);
       if (!lineEl) return;
       const blockKind = lineEl.getAttribute("data-block") || "normal";
@@ -565,11 +762,27 @@ export default function LiveMarkdownEditor({
 
       if (e.key === "Enter") {
         e.preventDefault();
+
+        // Live fenced code block shortcut on Enter: ``` or ```py + Enter
+        const rawLineText = contentHost.textContent.replace(/\u200B/g, "").trim();
+        const fenceEnter = blockKind === "normal" ? rawLineText.match(/^```([a-zA-Z0-9+#.-]*)$/) : null;
+        if (fenceEnter && lineEl.parentElement === editor) {
+          suppressEnterUntilRef.current = performance.now() + 80;
+          const lang = fenceEnter[1] ? normalizeCodeLang(fenceEnter[1]) : "javascript";
+          const tmp = document.createElement("div");
+          tmp.innerHTML = buildLiveCodeBlockHtml("", lang, { isZh: isZhRef.current });
+          const wrap = tmp.firstElementChild;
+          editor.replaceChild(wrap, lineEl);
+          focusCodeBlockInput(wrap, false);
+          syncToTextarea();
+          emitFormats();
+          return;
+        }
+
         if (!range.collapsed) {
           range.deleteContents();
         }
-        const isEmpty =
-          contentHost.textContent.replace(/\u200B/g, "").trim().length === 0;
+        const isEmpty = rawLineText.length === 0;
 
         if (
           isEmpty &&
@@ -617,6 +830,28 @@ export default function LiveMarkdownEditor({
       const target = e.target;
       if (!(target instanceof Element)) return;
 
+      // Allow native <select> dropdown in code block header
+      if (target.closest('[data-cb-lang="1"]')) {
+        return;
+      }
+
+      // Copy code button in code block header
+      const copyBtn = target.closest('[data-cb-copy="1"]');
+      if (copyBtn) {
+        e.preventDefault();
+        const wrap = copyBtn.closest('[data-md-codeblock="1"]');
+        const code = readCodeBlockValue(wrap);
+        try {
+          navigator.clipboard.writeText(code);
+        } catch {}
+        const orig = copyBtn.textContent;
+        copyBtn.textContent = isZhRef.current ? "已复制" : "Copied";
+        setTimeout(() => {
+          if (document.contains(copyBtn)) copyBtn.textContent = orig;
+        }, 1200);
+        return;
+      }
+
       // Toggle checklist checkbox
       const chk = target.closest('[data-md-check="1"]');
       if (chk) {
@@ -654,6 +889,12 @@ export default function LiveMarkdownEditor({
 
   const handlePaste = useCallback(
     (e) => {
+      // Let native textarea inside code block handle plain paste natively (native input listener highlights it!)
+      if (e.target instanceof HTMLTextAreaElement && e.target.getAttribute("data-cb-input") === "1") {
+        e.stopPropagation();
+        return;
+      }
+
       e.preventDefault();
       e.stopPropagation();
       const editor = editorRef.current;
@@ -675,10 +916,9 @@ export default function LiveMarkdownEditor({
         sel.removeAllRanges();
         sel.addRange(range);
       } else {
-        // Render pasted Markdown/multiline text live immediately!
         const pastedHtml = markdownToHtml(text, {
           tableOuterBorder: tableOuterBorderRef.current,
-          isZh,
+          isZh: isZhRef.current,
         });
         const curLine = getClosestLineEl(range.startContainer, editor);
         if (
@@ -718,40 +958,48 @@ export default function LiveMarkdownEditor({
             for (const n of insertedNodes) editor.appendChild(n);
           }
           const lastNode = insertedNodes[insertedNodes.length - 1];
+          const isCodeBlock = lastNode?.getAttribute?.("data-md-codeblock") === "1";
           const targetCell = lastNode?.querySelector?.("td:last-child, th:last-child");
-          placeCaretIn(targetCell || lastNode, false);
+          if (isCodeBlock) {
+            focusCodeBlockInput(lastNode, true);
+          } else {
+            placeCaretIn(targetCell || lastNode, false);
+          }
         }
       }
 
       syncToTextarea();
       emitFormats();
     },
-    [isZh, syncToTextarea, emitFormats]
+    [syncToTextarea, emitFormats]
   );
 
-  if (!taEl || !taEl.parentElement || !mirrorStyle || !nativeMd || readOnly) {
+  if (!taEl || !taEl.parentElement || !nativeMd || readOnly) {
     return null;
   }
+
+  const effectiveStyle = mirrorStyle || computeMirrorStyle(taEl);
+  if (!effectiveStyle) return null;
 
   return createPortal(
     <div
       ref={rootRef}
       className="md-live-editor-root"
       style={{
-        left: mirrorStyle.left,
-        top: mirrorStyle.top,
-        transform: mirrorStyle.transform,
-        transformOrigin: mirrorStyle.transformOrigin,
-        fontFamily: mirrorStyle.fontFamily,
-        fontSize: mirrorStyle.fontSize,
-        lineHeight: mirrorStyle.lineHeight,
-        textAlign: mirrorStyle.textAlign,
-        color: mirrorStyle.color,
-        opacity: mirrorStyle.opacity,
-        filter: mirrorStyle.filter,
-        minWidth: mirrorStyle.minWidth,
-        minHeight: mirrorStyle.minHeight,
-        width: mirrorStyle.width,
+        left: effectiveStyle.left,
+        top: effectiveStyle.top,
+        transform: effectiveStyle.transform,
+        transformOrigin: effectiveStyle.transformOrigin,
+        fontFamily: effectiveStyle.fontFamily,
+        fontSize: effectiveStyle.fontSize,
+        lineHeight: effectiveStyle.lineHeight,
+        textAlign: effectiveStyle.textAlign,
+        color: effectiveStyle.color,
+        opacity: effectiveStyle.opacity,
+        filter: effectiveStyle.filter,
+        minWidth: effectiveStyle.minWidth,
+        minHeight: effectiveStyle.minHeight,
+        width: effectiveStyle.width,
       }}
       onPointerDown={(e) => e.stopPropagation()}
       onMouseDown={handleMouseDown}
@@ -763,8 +1011,8 @@ export default function LiveMarkdownEditor({
         suppressContentEditableWarning
         spellCheck={false}
         style={{
-          whiteSpace: mirrorStyle.whiteSpace,
-          wordBreak: mirrorStyle.wordBreak,
+          whiteSpace: effectiveStyle.whiteSpace,
+          wordBreak: effectiveStyle.wordBreak,
         }}
         onInput={handleInput}
         onKeyDown={handleKeyDown}
@@ -773,9 +1021,9 @@ export default function LiveMarkdownEditor({
         onCompositionStart={() => {
           composingRef.current = true;
         }}
-        onCompositionEnd={() => {
+        onCompositionEnd={(e) => {
           composingRef.current = false;
-          handleInput();
+          handleInput(e);
         }}
       />
     </div>,

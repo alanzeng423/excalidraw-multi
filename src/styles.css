@@ -2648,3 +2648,244 @@ body {
   min-height: 1.45em;
   white-space: pre-wrap;
 }
+
+/* ===== Live Syntax-Highlighted Code Blocks (Native Text + Markdown Card) ===== */
+
+.md-live-codeblock {
+  display: inline-block;
+  min-width: 220px;
+  margin: 0.22em 0;
+  border-radius: 6px;
+  border: 1.1px solid rgba(31, 35, 40, 0.16);
+  background: #f6f8fa;
+  overflow: hidden;
+  text-align: left;
+  vertical-align: top;
+}
+
+.md-live-cb-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 10px;
+  min-height: 24px;
+  background: #eef1f5;
+  border-bottom: 1px solid rgba(31, 35, 40, 0.1);
+  user-select: none;
+}
+
+.md-live-cb-lang {
+  font-family: "Cascadia", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  color: #57606a;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 1px 4px;
+  cursor: pointer;
+  outline: none;
+}
+
+.md-live-cb-lang:hover,
+.md-live-cb-lang:focus {
+  background: rgba(31, 35, 40, 0.06);
+  border-color: rgba(31, 35, 40, 0.14);
+}
+
+.md-live-cb-copy {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  color: #57606a;
+  background: transparent;
+  border: 1px solid rgba(31, 35, 40, 0.14);
+  border-radius: 4px;
+  padding: 1px 7px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.md-live-cb-copy:hover {
+  background: rgba(105, 101, 219, 0.12);
+  border-color: rgba(105, 101, 219, 0.35);
+  color: #443fc4;
+}
+
+.md-live-cb-stage {
+  display: grid;
+  position: relative;
+}
+
+.md-live-cb-pre,
+.md-live-cb-input {
+  grid-area: 1 / 1;
+  margin: 0;
+  padding: 10px 14px;
+  min-width: 220px;
+  min-height: 1.5em;
+  font-family: "Cascadia", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.84em;
+  line-height: 1.48;
+  letter-spacing: 0;
+  white-space: pre;
+  tab-size: 2;
+  box-sizing: border-box;
+  border: 0;
+  outline: 0;
+}
+
+.md-live-cb-pre {
+  color: #24292f;
+  pointer-events: none;
+  user-select: none;
+}
+
+.md-live-cb-input {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  caret-color: #24292f;
+  resize: none;
+  overflow: hidden;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Syntax highlight token colors (GitHub / One-Light; auto-inverts cleanly under Excalidraw dark filter) */
+.tok-comment {
+  color: #6a737d;
+  font-style: italic;
+}
+
+.tok-keyword {
+  color: #cf222e;
+  font-weight: 600;
+}
+
+.tok-string {
+  color: #0a7e3a;
+}
+
+.tok-number {
+  color: #b35900;
+}
+
+.tok-function {
+  color: #6639ba;
+}
+
+.tok-type {
+  color: #0550ae;
+}
+
+.tok-property {
+  color: #0550ae;
+}
+
+.tok-tag {
+  color: #116329;
+}
+
+.tok-variable {
+  color: #953800;
+}
+
+.tok-operator {
+  color: #57606a;
+}
+
+/* MarkdownCard syntax-highlighted code cards */
+.md-code-card {
+  margin: 8px 0;
+  border-radius: 6px;
+  border: 1px solid rgba(31, 35, 40, 0.14);
+  background: #f6f8fa;
+  overflow: hidden;
+}
+
+.md-code-card-head {
+  display: flex;
+  align-items: center;
+  padding: 3px 10px;
+  background: #eef1f5;
+  border-bottom: 1px solid rgba(31, 35, 40, 0.08);
+}
+
+.md-code-card-lang {
+  font-family: "Cascadia", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  color: #57606a;
+}
+
+.md-code-card-pre {
+  margin: 0 !important;
+  padding: 10px 12px !important;
+  background: transparent !important;
+  border: none !important;
+  overflow-x: auto;
+  font-family: "Cascadia", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #24292f;
+}
+
+.md-card.is-dark .md-code-card {
+  background: #1b1d24;
+  border-color: #323544;
+}
+
+.md-card.is-dark .md-code-card-head {
+  background: #232630;
+  border-bottom-color: #323544;
+}
+
+.md-card.is-dark .md-code-card-lang {
+  color: #9aa2b8;
+}
+
+.md-card.is-dark .md-code-card-pre {
+  color: #e6edf3;
+}
+
+.md-card.is-dark .tok-comment {
+  color: #8b949e;
+}
+
+.md-card.is-dark .tok-keyword {
+  color: #ff7b72;
+}
+
+.md-card.is-dark .tok-string {
+  color: #7ee787;
+}
+
+.md-card.is-dark .tok-number {
+  color: #ffa657;
+}
+
+.md-card.is-dark .tok-function {
+  color: #d2a8ff;
+}
+
+.md-card.is-dark .tok-type,
+.md-card.is-dark .tok-property {
+  color: #79c0ff;
+}
+
+.md-card.is-dark .tok-tag {
+  color: #7ee787;
+}
+
+.md-card.is-dark .tok-variable {
+  color: #ffa657;
+}
+
+.md-card.is-dark .tok-operator {
+  color: #c9d1d9;
+}

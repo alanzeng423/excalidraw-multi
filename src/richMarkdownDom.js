@@ -5,6 +5,11 @@ import {
   resolveHighlightColor,
   resolveTextColor,
 } from "./nativeMarkdown.js";
+import {
+  CODE_LANGUAGES,
+  highlightCodeToHtml,
+  normalizeCodeLang,
+} from "./codeHighlight.js";
 
 const ZWS = "\u200B";
 
@@ -95,6 +100,59 @@ function buildLiveTableHtml(block, { tableOuterBorder = true, isZh = true } = {}
   );
 }
 
+export function renderCodePreHtml(code, lang = "javascript") {
+  const clean = String(code ?? "").replace(/\r\n?/g, "\n");
+  if (!clean) {
+    return " ";
+  }
+  const highlighted = highlightCodeToHtml(clean, lang);
+  // Trailing space after trailing newline ensures <pre> height matches <textarea> empty last line
+  return clean.endsWith("\n") ? `${highlighted} ` : highlighted;
+}
+
+export function buildLiveCodeBlockHtml(code = "", rawLang = "javascript", { isZh = true } = {}) {
+  const lang = normalizeCodeLang(rawLang || "javascript");
+  const optionsHtml = CODE_LANGUAGES.map(
+    (l) =>
+      `<option value="${l.id}"${l.id === lang ? " selected" : ""}>${escapeHtml(l.label)}</option>`
+  ).join("");
+  const copyLabel = isZh ? "复制" : "Copy";
+  const langAria = isZh ? "编程语言" : "Language";
+  const preHtml = renderCodePreHtml(code, lang);
+  const safeVal = escapeHtml(String(code ?? "").replace(/\r\n?/g, "\n"));
+
+  return (
+    `<div class="md-live-codeblock" contenteditable="false" data-md-codeblock="1" data-lang="${lang}">` +
+    `<div class="md-live-cb-head">` +
+    `<select class="md-live-cb-lang" data-cb-lang="1" aria-label="${langAria}">${optionsHtml}</select>` +
+    `<button type="button" class="md-live-cb-copy" data-cb-copy="1">${copyLabel}</button>` +
+    `</div>` +
+    `<div class="md-live-cb-stage">` +
+    `<pre class="md-live-cb-pre" aria-hidden="true" data-cb-pre="1">${preHtml}</pre>` +
+    `<textarea class="md-live-cb-input" data-cb-input="1" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" rows="1">${safeVal}</textarea>` +
+    `</div>` +
+    `</div>`
+  );
+}
+
+export function readCodeBlockValue(wrapEl) {
+  if (!wrapEl) return "";
+  const input = wrapEl.querySelector('[data-cb-input="1"]');
+  if (input && typeof input.value === "string") {
+    return input.value.replace(/\r\n?/g, "\n");
+  }
+  const pre = wrapEl.querySelector('[data-cb-pre="1"]');
+  return (pre?.textContent || "").replace(/\r\n?/g, "\n");
+}
+
+export function focusCodeBlockInput(wrapEl, atEnd = true) {
+  const input = wrapEl?.querySelector?.('[data-cb-input="1"]');
+  if (!input) return;
+  input.focus({ preventScroll: true });
+  const pos = atEnd ? input.value.length : 0;
+  input.setSelectionRange(pos, pos);
+}
+
 export function createBlankLiveTableHtml(opts = {}) {
   const emptyBlock = {
     type: "table",
@@ -148,7 +206,17 @@ export function markdownToHtml(markdown, { tableOuterBorder = true, isZh = true,
   const blocks = parseMarkdownBlocks(lines);
   const parts = [];
   for (const block of blocks) {
-    if (block.type === "table" && allowTables) {
+    if (block.type === "codeblock" && allowTables) {
+      parts.push(
+        buildLiveCodeBlockHtml(block.lines.join("\n"), block.lang || block.rawLang || "text", {
+          isZh,
+        })
+      );
+    } else if (block.type === "codeblock") {
+      for (const cl of block.lines) {
+        parts.push(`<div class="md-live-line" data-block="normal"><code class="md-live-code">${escapeHtml(cl)}</code></div>`);
+      }
+    } else if (block.type === "table" && allowTables) {
       parts.push(buildLiveTableHtml(block, { tableOuterBorder, isZh }));
     } else if (block.type === "table") {
       // Fallback when tables aren't nested (e.g. inside a table cell)
@@ -313,6 +381,16 @@ export function domToMarkdown(rootEl) {
     if (node.nodeType !== 1) return;
     const el = node;
 
+    if (el.getAttribute("data-md-codeblock") === "1") {
+      const lang = el.getAttribute("data-lang") || "text";
+      const code = readCodeBlockValue(el);
+      const fenceLang = lang === "text" ? "" : lang;
+      lines.push(`\`\`\`${fenceLang}`);
+      lines.push(...code.split("\n"));
+      lines.push("```");
+      return;
+    }
+
     if (el.getAttribute("data-md-table") === "1" || el.tagName === "TABLE") {
       const tbl = el.tagName === "TABLE" ? el : el.querySelector("table");
       if (tbl) {
@@ -456,6 +534,18 @@ export function tryLiveMarkdownRule(rootEl) {
     preRange.setStart(lineEl, 0);
     preRange.setEnd(node, offset);
     const fullBefore = cleanText(preRange.toString());
+
+    // Live fenced code block shortcut: ``` or ```js + space
+    const fenceM = fullBefore.match(/^```([a-zA-Z0-9+#.-]*)\s$/);
+    if (fenceM && lineEl.parentElement === rootEl) {
+      const lang = fenceM[1] ? normalizeCodeLang(fenceM[1]) : "javascript";
+      const tmp = document.createElement("div");
+      tmp.innerHTML = buildLiveCodeBlockHtml("", lang, { isZh: true });
+      const wrap = tmp.firstElementChild;
+      rootEl.replaceChild(wrap, lineEl);
+      focusCodeBlockInput(wrap, false);
+      return true;
+    }
 
     const blockRules = [
       { re: /^###\s$/, kind: "h3" },
@@ -765,6 +855,25 @@ export function applyDomRichAction(rootEl, action, { savedRange = null, tableOut
     range.collapse(false);
     sel?.removeAllRanges();
     sel?.addRange(range);
+  }
+
+  if (action.type === "insert-codeblock") {
+    const tmp = document.createElement("div");
+    tmp.innerHTML = buildLiveCodeBlockHtml("", action.lang || "javascript", { isZh });
+    const wrap = tmp.firstElementChild;
+    const curLine = getClosestLineEl(range.startContainer, rootEl);
+    if (curLine && curLine.parentElement === rootEl) {
+      const isEmptyLine = cleanText(curLine.textContent).trim() === "";
+      if (isEmptyLine) {
+        rootEl.replaceChild(wrap, curLine);
+      } else {
+        curLine.insertAdjacentElement("afterend", wrap);
+      }
+    } else {
+      rootEl.appendChild(wrap);
+    }
+    focusCodeBlockInput(wrap, false);
+    return true;
   }
 
   if (action.type === "insert-md-table") {

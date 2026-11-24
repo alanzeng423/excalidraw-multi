@@ -1,4 +1,10 @@
 import rough from "roughjs";
+import {
+  TOKEN_COLORS,
+  getCodeLangLabel,
+  normalizeCodeLang,
+  tokenizeCode,
+} from "./codeHighlight.js";
 
 const STORAGE_KEY = "excalidraw-multi:native-md";
 
@@ -470,9 +476,19 @@ function balanceWrappedLines(lines) {
 
   const out = [];
   const openStack = []; // { open: string, close: string, tag: string }
+  let inCodeFence = false;
 
   for (let li = 0; li < lines.length; li += 1) {
     const raw = lines[li];
+    if (/^\s*```/.test(raw)) {
+      inCodeFence = !inCodeFence;
+      out.push(raw);
+      continue;
+    }
+    if (inCodeFence) {
+      out.push(raw);
+      continue;
+    }
     const remainingText = lines.slice(li + 1).join("\n");
 
     // Re-open tags carried over from previous line
@@ -582,6 +598,31 @@ export function parseMarkdownBlocks(lines) {
   let i = 0;
   while (i < lines.length) {
     const line = String(lines[i] ?? "");
+
+    // Fenced code block: ```lang ... ```
+    const fenceOpen = line.match(/^\s*```([^\s`]*)\s*$/);
+    if (fenceOpen) {
+      const rawLang = fenceOpen[1] || "";
+      const lang = normalizeCodeLang(rawLang);
+      const codeLines = [];
+      let j = i + 1;
+      let closed = false;
+      while (j < lines.length) {
+        const nextLine = String(lines[j] ?? "");
+        if (/^\s*```\s*$/.test(nextLine)) {
+          closed = true;
+          j += 1;
+          break;
+        }
+        codeLines.push(nextLine);
+        j += 1;
+      }
+      if (codeLines.length === 0) codeLines.push("");
+      blocks.push({ type: "codeblock", lang, rawLang, lines: codeLines, closed });
+      i = j;
+      continue;
+    }
+
     if (
       i + 1 < lines.length &&
       line.includes("|") &&
@@ -711,6 +752,58 @@ function measureSpansList(ctx, spans, fontSize, fontFamily) {
   return { totalWidth: total, spanMetrics };
 }
 
+function measureCodeBlock(ctx, block, fontSize) {
+  const codeFontSize = Math.max(11, fontSize * 0.84);
+  const codeLineH = codeFontSize * 1.48;
+  const headerH = Math.max(22, codeFontSize * 1.65);
+  const padX = Math.max(12, codeFontSize * 0.85);
+  const padY = Math.max(10, codeFontSize * 0.65);
+  const marginY = Math.max(4, fontSize * 0.22);
+  const lineCount = Math.max(1, block.lines.length);
+  const showLineNums = lineCount >= 2;
+  const gutterW = showLineNums
+    ? Math.max(26, String(lineCount).length * codeFontSize * 0.68 + 14)
+    : 0;
+
+  let maxLineW = 0;
+  if (ctx) {
+    const tokenLines = tokenizeCode(block.lines.join("\n"), block.lang);
+    for (const lineTokens of tokenLines) {
+      let lw = 0;
+      for (const tok of lineTokens) {
+        const isComment = tok.type === "comment";
+        const isKw = tok.type === "keyword";
+        ctx.font = `${isComment ? "italic " : ""}${isKw ? "600 " : ""}${codeFontSize}px ${CODE_FONT}`;
+        lw += ctx.measureText(tok.text).width;
+      }
+      if (lw > maxLineW) maxLineW = lw;
+    }
+  } else {
+    for (const line of block.lines) {
+      const w = (line || " ").length * codeFontSize * 0.66;
+      if (w > maxLineW) maxLineW = w;
+    }
+  }
+
+  const totalWidth = Math.max(220, maxLineW + gutterW + padX * 2 + 24);
+  const boxH = headerH + lineCount * codeLineH + padY * 2;
+  const totalHeight = boxH + marginY * 2;
+
+  return {
+    codeFontSize,
+    codeLineH,
+    headerH,
+    padX,
+    padY,
+    marginY,
+    showLineNums,
+    gutterW,
+    boxH,
+    totalWidth,
+    totalHeight,
+  };
+}
+
 function measureMarkdownTable(ctx, block, fontSize, fontFamily, lineHeightPx) {
   const padX = Math.max(8, fontSize * 0.55);
   const rowH = Math.max(lineHeightPx * 1.28, fontSize * 1.65);
@@ -766,10 +859,14 @@ function measureParsedLine(ctx, parsed, baseFontSize, fontFamily) {
 
 function measureLineWidth(ctx, line, fontStr, isTestEnv) {
   const { fontSize, fontFamily } = parseFontString(fontStr);
-  if (isMarkdownTableSeparator(line)) {
+  const s = String(line ?? "");
+  if (/^\s*```/.test(s)) {
+    const minW = Math.max(220, fontSize * 11);
+    return isTestEnv ? minW * 10 : minW;
+  }
+  if (isMarkdownTableSeparator(s)) {
     return isTestEnv ? 10 : 1;
   }
-  const s = String(line ?? "");
   if (s.includes("|") && (s.trim().startsWith("|") || s.split("|").length >= 3)) {
     const cells = splitMarkdownTableRow(s);
     const padX = Math.max(8, fontSize * 0.55);
@@ -780,9 +877,17 @@ function measureLineWidth(ctx, line, fontStr, isTestEnv) {
     }
     return isTestEnv ? total * 10 : total;
   }
-  const parsed = parseMarkdownLine(line);
+  const parsed = parseMarkdownLine(s);
   const { totalWidth } = measureParsedLine(ctx, parsed, fontSize, fontFamily);
-  return isTestEnv ? totalWidth * 10 : totalWidth;
+  // Ensure code lines inside fenced blocks never clip horizontally in PNG/SVG export
+  let finalW = totalWidth;
+  if (/[{};=<>]|\/\/|^\s{2,}/.test(s)) {
+    const codeFontSize = Math.max(11, fontSize * 0.84);
+    ctx.font = `600 ${codeFontSize}px ${CODE_FONT}`;
+    const codeW = ctx.measureText(s).width + 82;
+    if (codeW > finalW) finalW = codeW;
+  }
+  return isTestEnv ? finalW * 10 : finalW;
 }
 
 function measureBlockHeight(lines, fontSize, lineHeight) {
@@ -790,7 +895,10 @@ function measureBlockHeight(lines, fontSize, lineHeight) {
   const blocks = parseMarkdownBlocks(lines);
   let total = 0;
   for (const block of blocks) {
-    if (block.type === "table") {
+    if (block.type === "codeblock") {
+      const cm = measureCodeBlock(null, block, fontSize);
+      total += cm.totalHeight;
+    } else if (block.type === "table") {
       const rowH = Math.max(baseLinePx * 1.28, fontSize * 1.65);
       const marginY = Math.max(2, fontSize * 0.14);
       total += block.rows.length * rowH + marginY * 2;
@@ -893,6 +1001,94 @@ function drawCanvasText(ctx, element, rawLines, opts) {
   let cursorY = 0;
 
   for (const block of blocks) {
+    if (block.type === "codeblock") {
+      const fontSize = element.fontSize;
+      const cm = measureCodeBlock(ctx, block, fontSize);
+      const boxW = Math.max(cm.totalWidth, element.width);
+      let boxX = 0;
+      if (element.textAlign === "center") {
+        boxX = (element.width - boxW) / 2;
+      } else if (element.textAlign === "right") {
+        boxX = element.width - boxW;
+      }
+      const boxY = cursorY + cm.marginY;
+      const radius = 6;
+
+      ctx.save();
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+
+      // Code card background & border
+      drawRoundedRect(ctx, boxX, boxY, boxW, cm.boxH, radius);
+      ctx.fillStyle = "#f6f8fa";
+      ctx.fill();
+
+      // Header bar clipped inside card
+      ctx.save();
+      drawRoundedRect(ctx, boxX, boxY, boxW, cm.boxH, radius);
+      ctx.clip();
+      ctx.fillStyle = "#eef1f5";
+      ctx.fillRect(boxX, boxY, boxW, cm.headerH);
+      ctx.strokeStyle = "rgba(31, 35, 40, 0.1)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(boxX, boxY + cm.headerH);
+      ctx.lineTo(boxX + boxW, boxY + cm.headerH);
+      ctx.stroke();
+
+      // Language label in header
+      const langLabel = getCodeLangLabel(block.lang);
+      const labelFs = Math.max(10, cm.codeFontSize * 0.78);
+      ctx.font = `600 ${labelFs}px ${CODE_FONT}`;
+      ctx.fillStyle = "#57606a";
+      ctx.fillText(
+        langLabel,
+        boxX + cm.padX,
+        boxY + cm.headerH * 0.68
+      );
+
+      // Tokenized syntax-highlighted code lines
+      const tokenLines = tokenizeCode(block.lines.join("\n"), block.lang);
+      const codeStartX = boxX + cm.padX + cm.gutterW;
+      for (let li = 0; li < tokenLines.length; li += 1) {
+        const lineTop = boxY + cm.headerH + cm.padY + li * cm.codeLineH;
+        const baselineY = lineTop + cm.codeFontSize * 0.96;
+
+        if (cm.showLineNums) {
+          ctx.font = `${cm.codeFontSize * 0.88}px ${CODE_FONT}`;
+          ctx.fillStyle = "#9aa2ac";
+          const numStr = String(li + 1);
+          const numW = ctx.measureText(numStr).width;
+          ctx.fillText(
+            numStr,
+            boxX + cm.padX + cm.gutterW - 12 - numW,
+            baselineY
+          );
+        }
+
+        let tx = codeStartX;
+        for (const tok of tokenLines[li]) {
+          const isComment = tok.type === "comment";
+          const isKw = tok.type === "keyword";
+          ctx.font = `${isComment ? "italic " : ""}${isKw ? "600 " : ""}${cm.codeFontSize}px ${CODE_FONT}`;
+          ctx.fillStyle = TOKEN_COLORS[tok.type] || TOKEN_COLORS.plain;
+          ctx.fillText(tok.text, tx, baselineY);
+          tx += ctx.measureText(tok.text).width;
+        }
+      }
+      ctx.restore();
+
+      // Subtle card outline
+      drawRoundedRect(ctx, boxX, boxY, boxW, cm.boxH, radius);
+      ctx.strokeStyle = "rgba(31, 35, 40, 0.16)";
+      ctx.lineWidth = 1.1;
+      ctx.stroke();
+
+      ctx.restore();
+      cursorY += cm.totalHeight;
+      continue;
+    }
+
     if (block.type === "table") {
       const fontSize = element.fontSize;
       const tm = measureMarkdownTable(
@@ -1187,6 +1383,104 @@ function appendSvgText(doc, svgNS, group, element, rawLines, opts) {
   let cursorY = 0;
 
   for (const block of blocks) {
+    if (block.type === "codeblock") {
+      const fontSize = element.fontSize;
+      const cm = measureCodeBlock(ctx, block, fontSize);
+      const boxW = cm.totalWidth;
+      let boxX = 0;
+      if (element.textAlign === "center") {
+        boxX = (element.width - boxW) / 2;
+      } else if (element.textAlign === "right") {
+        boxX = element.width - boxW;
+      }
+      const boxY = cursorY + cm.marginY;
+      const radius = 6;
+
+      // Card background
+      const bgRect = doc.createElementNS(svgNS, "rect");
+      bgRect.setAttribute("x", String(boxX));
+      bgRect.setAttribute("y", String(boxY));
+      bgRect.setAttribute("width", String(boxW));
+      bgRect.setAttribute("height", String(cm.boxH));
+      bgRect.setAttribute("rx", String(radius));
+      bgRect.setAttribute("fill", "#f6f8fa");
+      bgRect.setAttribute("stroke", "rgba(31, 35, 40, 0.16)");
+      bgRect.setAttribute("stroke-width", "1.1");
+      group.appendChild(bgRect);
+
+      // Header fill + separator
+      const headRect = doc.createElementNS(svgNS, "rect");
+      headRect.setAttribute("x", String(boxX + 0.5));
+      headRect.setAttribute("y", String(boxY + 0.5));
+      headRect.setAttribute("width", String(Math.max(0, boxW - 1)));
+      headRect.setAttribute("height", String(cm.headerH));
+      headRect.setAttribute("rx", String(radius));
+      headRect.setAttribute("fill", "#eef1f5");
+      group.appendChild(headRect);
+
+      const headLine = doc.createElementNS(svgNS, "line");
+      headLine.setAttribute("x1", String(boxX));
+      headLine.setAttribute("y1", String(boxY + cm.headerH));
+      headLine.setAttribute("x2", String(boxX + boxW));
+      headLine.setAttribute("y2", String(boxY + cm.headerH));
+      headLine.setAttribute("stroke", "rgba(31, 35, 40, 0.1)");
+      headLine.setAttribute("stroke-width", "1");
+      group.appendChild(headLine);
+
+      const labelFs = Math.max(10, cm.codeFontSize * 0.78);
+      const langText = doc.createElementNS(svgNS, "text");
+      langText.textContent = getCodeLangLabel(block.lang);
+      langText.setAttribute("x", String(boxX + cm.padX));
+      langText.setAttribute("y", String(boxY + cm.headerH * 0.68));
+      langText.setAttribute("font-family", CODE_FONT);
+      langText.setAttribute("font-size", `${labelFs}px`);
+      langText.setAttribute("font-weight", "600");
+      langText.setAttribute("fill", "#57606a");
+      group.appendChild(langText);
+
+      const tokenLines = tokenizeCode(block.lines.join("\n"), block.lang);
+      const codeStartX = boxX + cm.padX + cm.gutterW;
+      for (let li = 0; li < tokenLines.length; li += 1) {
+        const lineTop = boxY + cm.headerH + cm.padY + li * cm.codeLineH;
+        const baselineY = lineTop + cm.codeFontSize * 0.96;
+
+        if (cm.showLineNums) {
+          const numText = doc.createElementNS(svgNS, "text");
+          numText.textContent = String(li + 1);
+          numText.setAttribute("x", String(boxX + cm.padX + cm.gutterW - 12));
+          numText.setAttribute("y", String(baselineY));
+          numText.setAttribute("text-anchor", "end");
+          numText.setAttribute("font-family", CODE_FONT);
+          numText.setAttribute("font-size", `${cm.codeFontSize * 0.88}px`);
+          numText.setAttribute("fill", "#9aa2ac");
+          group.appendChild(numText);
+        }
+
+        let tx = codeStartX;
+        for (const tok of tokenLines[li]) {
+          const isComment = tok.type === "comment";
+          const isKw = tok.type === "keyword";
+          ctx.font = `${isComment ? "italic " : ""}${isKw ? "600 " : ""}${cm.codeFontSize}px ${CODE_FONT}`;
+          const t = doc.createElementNS(svgNS, "text");
+          t.textContent = tok.text;
+          t.setAttribute("x", String(tx));
+          t.setAttribute("y", String(baselineY));
+          t.setAttribute("font-family", CODE_FONT);
+          t.setAttribute("font-size", `${cm.codeFontSize}px`);
+          t.setAttribute("fill", TOKEN_COLORS[tok.type] || TOKEN_COLORS.plain);
+          t.setAttribute("style", "white-space: pre;");
+          t.setAttribute("dominant-baseline", "alphabetic");
+          if (isComment) t.setAttribute("font-style", "italic");
+          if (isKw) t.setAttribute("font-weight", "600");
+          group.appendChild(t);
+          tx += ctx.measureText(tok.text).width;
+        }
+      }
+
+      cursorY += cm.totalHeight;
+      continue;
+    }
+
     if (block.type === "table") {
       const fontSize = element.fontSize;
       const tm = measureMarkdownTable(
@@ -1445,7 +1739,11 @@ export function measureNativeTextBox(text, fontSize, fontFamilyStr, lineHeight) 
   if (enabled) {
     const blocks = parseMarkdownBlocks(lines);
     for (const block of blocks) {
-      if (block.type === "table") {
+      if (block.type === "codeblock") {
+        const cm = measureCodeBlock(ctx, block, fontSize);
+        width = Math.max(width, cm.totalWidth);
+        height += cm.totalHeight;
+      } else if (block.type === "table") {
         const tm = measureMarkdownTable(ctx, block, fontSize, fontFamilyStr, baseLinePx);
         width = Math.max(width, tm.totalWidth);
         height += tm.totalHeight;

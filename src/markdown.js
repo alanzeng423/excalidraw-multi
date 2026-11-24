@@ -1,6 +1,7 @@
 import { marked } from "marked";
 import katex from "katex";
 import DOMPurify from "dompurify";
+import { getCodeLangLabel, highlightCodeToHtml, normalizeCodeLang } from "./codeHighlight";
 
 export const MARKDOWN_LINK = "markdown://note";
 
@@ -19,9 +20,18 @@ $$E = mc^2, \\quad \\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}$$
 | KaTeX Math | Ready |
 `;
 
+const mdRenderer = new marked.Renderer();
+mdRenderer.code = ({ text, lang }) => {
+  const norm = normalizeCodeLang(lang);
+  const label = getCodeLangLabel(norm);
+  const highlighted = highlightCodeToHtml(text || "", norm);
+  return `<div class="md-code-card"><div class="md-code-card-head"><span class="md-code-card-lang">${label}</span></div><pre class="md-code-card-pre"><code class="language-${norm}">${highlighted}</code></pre></div>`;
+};
+
 marked.setOptions({
   gfm: true,
   breaks: true,
+  renderer: mdRenderer,
 });
 
 function renderKatex(expr, displayMode) {
