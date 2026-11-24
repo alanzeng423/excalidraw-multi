@@ -1,4 +1,4 @@
-import { bindings, defineConfig } from "cf/config";
+import { bindings, defineConfig, exports } from "cf/config";
 
 const domains = process.env.WORKER_DOMAIN
   ? process.env.WORKER_DOMAIN.split(",")
@@ -18,14 +18,21 @@ export default defineConfig({
     workersDev: !domains,
     previewUrls: false,
     ...(domains ? { domains } : {}),
+    exports: {
+      BoardBridge: exports.durableObject({ storage: "sqlite" }),
+    },
     env: {
       ASSETS: bindings.assets(),
+      BOARD_BRIDGE: bindings.durableObject({
+        worker: "excalidraw-multi",
+        exportName: "BoardBridge",
+      }),
       ...(sharesBinding ? { SHARES: sharesBinding } : {}),
     },
     assets: {
       htmlHandling: "auto-trailing-slash",
       notFoundHandling: "single-page-application",
-      runWorkerFirst: ["/api/*"],
+      runWorkerFirst: ["/api/*", "/mcp", "/mcp/*"],
     },
   },
 });

@@ -1,3 +1,6 @@
+import { DurableObject } from "cloudflare:workers";
+import { MCP_INSTRUCTIONS, MCP_TOOLS } from "./mcpTools.js";
+
 const ALLOWED_WEBDAV_METHODS = new Set([
   "GET",
   "HEAD",
@@ -274,6 +277,436 @@ async function handleGetShare(id, env) {
   });
 }
 
+const ALLOWED_TOOL_NAMES = new Set(MCP_TOOLS.map((t) => t.name));
+
+const MCP_CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization, Accept, Mcp-Session-Id, MCP-Protocol-Version",
+  "Access-Control-Expose-Headers": "Mcp-Session-Id",
+  "Cache-Control": "no-store",
+};
+
+function constantTimeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length || a.length === 0) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+function parseAgentToken(request, url) {
+  let raw = "";
+  const auth = request.headers.get("Authorization") || "";
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    raw = auth.slice(7).trim();
+  }
+  if (!raw) {
+    raw = (url.searchParams.get("token") || "").trim();
+  }
+  if (!raw && url.pathname.startsWith("/mcp/")) {
+    const parts = url.pathname.slice("/mcp/".length).split("/").filter(Boolean);
+    if (parts.length === 2) {
+      raw = `${decodeURIComponent(parts[0])}.${decodeURIComponent(parts[1])}`;
+    } else if (parts.length === 1) {
+      raw = decodeURIComponent(parts[0]);
+    }
+  }
+  const dot = raw.indexOf(".");
+  if (dot <= 0 || dot >= raw.length - 1) return null;
+  const boardId = raw.slice(0, dot).trim();
+  const secret = raw.slice(dot + 1).trim();
+  if (!/^[a-z0-9_-]{3,64}$/i.test(boardId) || secret.length < 12 || secret.length > 128) {
+    return null;
+  }
+  return { boardId, secret };
+}
+
+export class BoardBridge extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.browserWs = null;
+    this.activeSecret = "";
+    this.pending = new Map();
+    this.lastActivityAt = 0;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const secret = url.searchParams.get("secret") || "";
+    if (secret.length < 12 || secret.length > 128) {
+      return new Response("Invalid secret", { status: 400 });
+    }
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("Expected WebSocket upgrade", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+
+    // Replace any previous stale browser socket for this board
+    if (this.browserWs && this.browserWs !== server) {
+      try {
+        this.browserWs.close(4000, "Replaced by newer tab connection");
+      } catch {}
+    }
+
+    this.browserWs = server;
+    this.activeSecret = secret;
+    this.lastActivityAt = Date.now();
+
+    server.addEventListener("message", (evt) => {
+      this.lastActivityAt = Date.now();
+      let msg;
+      try {
+        msg = JSON.parse(typeof evt.data === "string" ? evt.data : "");
+      } catch {
+        return;
+      }
+      if (!msg || typeof msg !== "object") return;
+
+      if (msg.type === "ping") {
+        try {
+          server.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+        } catch {}
+        return;
+      }
+
+      if (msg.type === "rpc_response" && msg.requestId) {
+        const entry = this.pending.get(msg.requestId);
+        if (!entry) return;
+        this.pending.delete(msg.requestId);
+        clearTimeout(entry.timer);
+        entry.resolve({
+          ok: Boolean(msg.ok),
+          result: msg.result,
+          error: msg.error || null,
+        });
+      }
+    });
+
+    const cleanup = () => {
+      if (this.browserWs === server) {
+        this.browserWs = null;
+        this.activeSecret = "";
+        for (const [reqId, entry] of this.pending.entries()) {
+          clearTimeout(entry.timer);
+          entry.resolve({
+            ok: false,
+            status: 503,
+            error: "Browser tab disconnected before completing the request.",
+          });
+          this.pending.delete(reqId);
+        }
+      }
+    };
+
+    server.addEventListener("close", cleanup);
+    server.addEventListener("error", cleanup);
+
+    try {
+      server.send(JSON.stringify({ type: "ready", ts: Date.now() }));
+    } catch {}
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async getStatus(secret) {
+    const connected = Boolean(this.browserWs && this.browserWs.readyState === 1);
+    const authorized = connected && constantTimeEqual(secret, this.activeSecret);
+    return {
+      connected,
+      authorized,
+      lastActivityAt: this.lastActivityAt,
+    };
+  }
+
+  async callTool(secret, toolName, args) {
+    if (!this.browserWs || this.browserWs.readyState !== 1) {
+      return {
+        ok: false,
+        status: 503,
+        error:
+          "Board is not currently connected in a browser tab. Open this board and enable Agent Control first.",
+      };
+    }
+    if (!constantTimeEqual(secret, this.activeSecret)) {
+      return {
+        ok: false,
+        status: 401,
+        error:
+          "Invalid or rotated Agent token. Copy the current token from the board's Agent panel.",
+      };
+    }
+
+    const requestId = crypto.randomUUID();
+    this.lastActivityAt = Date.now();
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(requestId);
+        resolve({
+          ok: false,
+          status: 504,
+          error: "Timed out waiting for browser board response (30s).",
+        });
+      }, 30_000);
+
+      this.pending.set(requestId, { resolve, timer });
+      try {
+        this.browserWs.send(
+          JSON.stringify({
+            type: "rpc_request",
+            requestId,
+            tool: toolName,
+            args: args || {},
+          })
+        );
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(requestId);
+        resolve({
+          ok: false,
+          status: 503,
+          error: `Failed to forward request to browser: ${err?.message || err}`,
+        });
+      }
+    });
+  }
+}
+
+function mcpJsonResponse(body, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      ...MCP_CORS_HEADERS,
+      ...extraHeaders,
+    },
+  });
+}
+
+function formatMcpToolResult(rpc) {
+  if (!rpc.ok) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: rpc.error || "Tool execution failed." }],
+    };
+  }
+  if (rpc.result && rpc.result.__mcpImage && rpc.result.data) {
+    return {
+      content: [
+        {
+          type: "image",
+          data: rpc.result.data,
+          mimeType: rpc.result.mimeType || "image/png",
+        },
+        {
+          type: "text",
+          text: JSON.stringify({
+            width: rpc.result.width,
+            height: rpc.result.height,
+            elementCount: rpc.result.elementCount,
+          }),
+        },
+      ],
+    };
+  }
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          typeof rpc.result === "string"
+            ? rpc.result
+            : JSON.stringify(rpc.result ?? {}),
+      },
+    ],
+  };
+}
+
+async function handleMcpRequest(request, env, url) {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: MCP_CORS_HEADERS });
+  }
+
+  if (request.method === "DELETE") {
+    return new Response(null, { status: 204, headers: MCP_CORS_HEADERS });
+  }
+
+  if (request.method === "GET") {
+    const parsed = parseAgentToken(request, url);
+    let statusInfo = { connected: false };
+    if (parsed && env.BOARD_BRIDGE) {
+      const stub = env.BOARD_BRIDGE.getByName(parsed.boardId);
+      statusInfo = await stub.getStatus(parsed.secret);
+    }
+    return mcpJsonResponse({
+      name: "excalidraw-multi-board",
+      protocol: "MCP Streamable HTTP (POST JSON-RPC 2.0)",
+      boardId: parsed?.boardId || null,
+      ...statusInfo,
+    });
+  }
+
+  if (request.method !== "POST") {
+    return mcpJsonResponse({ error: "Method not allowed" }, 405);
+  }
+
+  const parsedToken = parseAgentToken(request, url);
+  if (!parsedToken) {
+    return mcpJsonResponse(
+      {
+        jsonrpc: "2.0",
+        id: null,
+        error: {
+          code: -32001,
+          message:
+            "Missing or invalid board token. Pass ?token=<boardId>.<secret> or Authorization: Bearer <boardId>.<secret>.",
+        },
+      },
+      401
+    );
+  }
+
+  let msg;
+  try {
+    msg = await request.json();
+  } catch {
+    return mcpJsonResponse(
+      { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Invalid JSON." } },
+      400
+    );
+  }
+
+  const isBatch = Array.isArray(msg);
+  const requests = isBatch ? msg : [msg];
+  const responses = [];
+
+  for (const item of requests) {
+    if (!item || typeof item !== "object") continue;
+    const { id, method, params } = item;
+
+    // Notifications have no id -> no JSON-RPC response body
+    if (id === undefined || method === "notifications/initialized" || method?.startsWith("notifications/")) {
+      continue;
+    }
+
+    if (method === "initialize") {
+      const clientProto = params?.protocolVersion || "2025-03-26";
+      responses.push({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: clientProto,
+          capabilities: { tools: {} },
+          serverInfo: {
+            name: "excalidraw-multi-board",
+            version: "1.0.0",
+          },
+          instructions: MCP_INSTRUCTIONS,
+        },
+      });
+      continue;
+    }
+
+    if (method === "ping") {
+      responses.push({ jsonrpc: "2.0", id, result: {} });
+      continue;
+    }
+
+    if (method === "tools/list") {
+      responses.push({
+        jsonrpc: "2.0",
+        id,
+        result: { tools: MCP_TOOLS },
+      });
+      continue;
+    }
+
+    if (method === "tools/call") {
+      const toolName = params?.name;
+      const toolArgs = params?.arguments || {};
+      if (!ALLOWED_TOOL_NAMES.has(toolName)) {
+        responses.push({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32602, message: `Unknown tool: ${toolName}` },
+        });
+        continue;
+      }
+      if (!env.BOARD_BRIDGE) {
+        responses.push({
+          jsonrpc: "2.0",
+          id,
+          result: {
+            isError: true,
+            content: [{ type: "text", text: "BOARD_BRIDGE Durable Object is not configured." }],
+          },
+        });
+        continue;
+      }
+
+      const stub = env.BOARD_BRIDGE.getByName(parsedToken.boardId);
+      const rpc = await stub.callTool(parsedToken.secret, toolName, toolArgs);
+      responses.push({
+        jsonrpc: "2.0",
+        id,
+        result: formatMcpToolResult(rpc),
+      });
+      continue;
+    }
+
+    responses.push({
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32601, message: `Method not found: ${method}` },
+    });
+  }
+
+  if (responses.length === 0) {
+    return new Response(null, { status: 202, headers: MCP_CORS_HEADERS });
+  }
+
+  return mcpJsonResponse(isBatch ? responses : responses[0], 200, {
+    "Mcp-Session-Id": parsedToken.boardId,
+  });
+}
+
+async function handleAgentRestCall(request, env, url) {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: MCP_CORS_HEADERS });
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return mcpJsonResponse({ ok: false, error: "Invalid JSON body." }, 400);
+  }
+  const fakeUrl = new URL(url.toString());
+  if (body?.token && !fakeUrl.searchParams.get("token")) {
+    fakeUrl.searchParams.set("token", String(body.token));
+  }
+  const parsedToken = parseAgentToken(request, fakeUrl);
+  if (!parsedToken) {
+    return mcpJsonResponse({ ok: false, error: "Missing or invalid board token." }, 401);
+  }
+  const toolName = body?.tool;
+  if (!ALLOWED_TOOL_NAMES.has(toolName)) {
+    return mcpJsonResponse({ ok: false, error: `Unknown tool: ${toolName}` }, 400);
+  }
+  if (!env.BOARD_BRIDGE) {
+    return mcpJsonResponse({ ok: false, error: "BOARD_BRIDGE is not configured." }, 503);
+  }
+  const stub = env.BOARD_BRIDGE.getByName(parsedToken.boardId);
+  const rpc = await stub.callTool(parsedToken.secret, toolName, body?.args || {});
+  return mcpJsonResponse(rpc, rpc.ok ? 200 : rpc.status || 500);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -289,6 +722,25 @@ export default {
     ) {
       const id = url.pathname.slice("/api/share/".length);
       return handleGetShare(id, env);
+    }
+    if (url.pathname === "/api/agent/ws") {
+      const originError = checkSameOrigin(request);
+      if (originError) return originError;
+      const boardId = url.searchParams.get("boardId") || "";
+      if (!/^[a-z0-9_-]{3,64}$/i.test(boardId)) {
+        return new Response("Invalid boardId", { status: 400 });
+      }
+      if (!env.BOARD_BRIDGE) {
+        return new Response("BOARD_BRIDGE is not configured", { status: 503 });
+      }
+      const stub = env.BOARD_BRIDGE.getByName(boardId);
+      return stub.fetch(request);
+    }
+    if (url.pathname === "/api/agent/call") {
+      return handleAgentRestCall(request, env, url);
+    }
+    if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+      return handleMcpRequest(request, env, url);
     }
     return env.ASSETS.fetch(request);
   },

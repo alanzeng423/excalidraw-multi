@@ -40,6 +40,16 @@ import {
   measureNativeTextBox,
   setNativeMarkdownEnabled,
 } from "./nativeMarkdown";
+import {
+  createBoardAgentClient,
+  describeAgentToolCall,
+  getBoardAgentConfig,
+  isWriteAgentTool,
+  rotateBoardAgentSecret,
+  saveBoardAgentConfig,
+} from "./agentBridge";
+import { executeAgentTool } from "./agentEngine";
+import AgentBridgeModal from "./AgentBridgeModal";
 
 const LANG_KEY = "excalidraw-multi:lang";
 
@@ -76,6 +86,21 @@ function BoardCanvas({ id }) {
   const [nativeMd, setNativeMd] = useState(() => getNativeMarkdownEnabled());
   const [langCode, setLangCode] = useState(getSavedLang);
   const [shareOpen, setShareOpen] = useState(false);
+  const [agentOpen, setAgentOpen] = useState(false);
+  const [agentConfig, setAgentConfig] = useState(() => getBoardAgentConfig(id));
+  const [agentStatus, setAgentStatus] = useState("off");
+  const [agentBusy, setAgentBusy] = useState(false);
+  const [agentToast, setAgentToast] = useState("");
+  const [agentLogs, setAgentLogs] = useState([]);
+  const [pendingAgentConfirm, setPendingAgentConfirm] = useState(null);
+
+  const agentModeRef = useRef(agentConfig.mode);
+  agentModeRef.current = agentConfig.mode;
+  const titleRef = useRef(title);
+  titleRef.current = title;
+  const langRef = useRef(langCode);
+  langRef.current = langCode;
+  const agentToastTimerRef = useRef(null);
 
   const readyRef = useRef(false);
   const readOnlyRef = useRef(false);
@@ -103,6 +128,103 @@ function BoardCanvas({ id }) {
   );
 
   useHandleLibrary({ excalidrawAPI: api, adapter: libraryAdapter });
+
+  // Reload per-board Agent config when switching boards
+  useEffect(() => {
+    setAgentConfig(getBoardAgentConfig(id));
+    setAgentLogs([]);
+    setPendingAgentConfirm(null);
+  }, [id]);
+
+  // Connect live WebSocket bridge for external Agents when enabled on this board
+  useEffect(() => {
+    if (!api || readOnly || !agentConfig.enabled) {
+      setAgentStatus("off");
+      return;
+    }
+
+    const pushLog = (summary, state) => {
+      const now = new Date();
+      const time = `${String(now.getHours()).padStart(2, "0")}:${String(
+        now.getMinutes()
+      ).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+      setAgentLogs((prev) => [
+        { id: `${Date.now()}_${Math.random()}`, time, summary, state },
+        ...prev.slice(0, 14),
+      ]);
+    };
+
+    const flashToast = (msg) => {
+      if (agentToastTimerRef.current) clearTimeout(agentToastTimerRef.current);
+      setAgentToast(msg);
+      agentToastTimerRef.current = setTimeout(() => setAgentToast(""), 2800);
+    };
+
+    const client = createBoardAgentClient({
+      boardId: id,
+      secret: agentConfig.secret,
+      onStatus: setAgentStatus,
+      onRpcRequest: async (toolName, toolArgs) => {
+        const curZh = langRef.current === "zh-CN";
+        const mode = agentModeRef.current;
+        const summary = describeAgentToolCall(toolName, toolArgs, curZh);
+        const isWrite = isWriteAgentTool(toolName);
+
+        if (isWrite && mode === "readonly") {
+          pushLog(summary, "denied");
+          throw new Error(
+            "Board Agent Bridge is currently in Read-Only mode. Ask the user to switch to Auto or Confirm mode."
+          );
+        }
+
+        if (isWrite && mode === "confirm") {
+          const approved = await new Promise((resolve) => {
+            setPendingAgentConfirm({
+              toolName,
+              summary,
+              resolve: (ok) => {
+                setPendingAgentConfirm(null);
+                resolve(ok);
+              },
+            });
+          });
+          if (!approved) {
+            pushLog(summary, "denied");
+            throw new Error("User rejected this board modification.");
+          }
+        }
+
+        setAgentBusy(true);
+        try {
+          const result = await executeAgentTool(api, toolName, toolArgs, {
+            boardId: id,
+            title: titleRef.current,
+          });
+          pushLog(summary, "ok");
+          if (isWrite) {
+            flashToast(
+              curZh
+                ? `Agent · ${summary}（Ctrl+Z 可撤回）`
+                : `Agent · ${summary} (Ctrl+Z to undo)`
+            );
+          } else {
+            flashToast(`Agent · ${summary}`);
+          }
+          return result;
+        } catch (err) {
+          pushLog(`${summary}: ${err?.message || err}`, "err");
+          throw err;
+        } finally {
+          setAgentBusy(false);
+        }
+      },
+    });
+
+    return () => {
+      client.stop();
+      if (agentToastTimerRef.current) clearTimeout(agentToastTimerRef.current);
+    };
+  }, [api, id, readOnly, agentConfig.enabled, agentConfig.secret]);
 
   const toggleLang = useCallback(() => {
     setLangCode((prev) => {
@@ -751,6 +873,31 @@ function BoardCanvas({ id }) {
                 >
                   {isZh ? "+表格" : "+Table"}
                 </button>
+                <button
+                  className={`btn small agent-open-btn ${
+                    agentConfig.enabled && agentStatus === "connected" ? "is-connected" : ""
+                  } ${agentBusy ? "is-busy" : ""}`}
+                  title={
+                    isZh
+                      ? "外部 Agent 控制 (MCP)：连接 Antigravity / Claude Code / Cursor"
+                      : "External Agent Control (MCP)"
+                  }
+                  onClick={() => setAgentOpen(true)}
+                >
+                  <span
+                    className={`agent-btn-dot ${
+                      !agentConfig.enabled
+                        ? "is-off"
+                        : agentBusy
+                          ? "is-busy"
+                          : agentStatus === "connected"
+                            ? "is-ok"
+                            : "is-warn"
+                    }`}
+                    aria-hidden="true"
+                  />
+                  <span>Agent</span>
+                </button>
               </>
             )}
             <button
@@ -819,6 +966,9 @@ function BoardCanvas({ id }) {
               <MainMenu.Item onSelect={handleInsertTableCard}>
                 {isZh ? "插入交互表格 (Alt+T)" : "Insert interactive table (Alt+T)"}
               </MainMenu.Item>
+              <MainMenu.Item onSelect={() => setAgentOpen(true)}>
+                {isZh ? "外部 Agent 联动 (MCP)" : "External Agent Control (MCP)"}
+              </MainMenu.Item>
             </>
           )}
           <MainMenu.Item onSelect={() => setShareOpen(true)}>
@@ -854,6 +1004,62 @@ function BoardCanvas({ id }) {
         onUpdateTable={handleUpdateTable}
         readOnly={readOnly}
       />
+
+      {agentToast && !pendingAgentConfirm && (
+        <div className="agent-live-toast" role="status" aria-live="polite">
+          <span className="agent-dot is-ok" />
+          <span>{agentToast}</span>
+        </div>
+      )}
+
+      {pendingAgentConfirm && (
+        <div className="agent-confirm-bar" role="alertdialog" aria-label="Agent confirmation">
+          <span className="agent-dot is-busy" />
+          <span className="agent-confirm-text">
+            {isZh
+              ? `外部 Agent 请求：${pendingAgentConfirm.summary}`
+              : `Agent requests: ${pendingAgentConfirm.summary}`}
+          </span>
+          <div className="agent-confirm-actions">
+            <button
+              type="button"
+              className="tool-btn primary"
+              onClick={() => pendingAgentConfirm.resolve(true)}
+            >
+              {isZh ? "允许应用" : "Approve"}
+            </button>
+            <button
+              type="button"
+              className="tool-btn outline"
+              onClick={() => pendingAgentConfirm.resolve(false)}
+            >
+              {isZh ? "拒绝" : "Reject"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {agentOpen && (
+        <AgentBridgeModal
+          boardId={id}
+          config={agentConfig}
+          status={agentStatus}
+          logs={agentLogs}
+          isZh={isZh}
+          onToggleEnabled={() => {
+            setAgentConfig((prev) =>
+              saveBoardAgentConfig(id, { ...prev, enabled: !prev.enabled })
+            );
+          }}
+          onChangeMode={(mode) => {
+            setAgentConfig((prev) => saveBoardAgentConfig(id, { ...prev, mode }));
+          }}
+          onRotateSecret={() => {
+            setAgentConfig(rotateBoardAgentSecret(id));
+          }}
+          onClose={() => setAgentOpen(false)}
+        />
+      )}
 
       {shareOpen && (
         <ShareModal
