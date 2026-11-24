@@ -46,39 +46,18 @@ export function createEmptyCell(text = "") {
   };
 }
 
-export function createDefaultTable(isZh = true) {
+export function createDefaultTable() {
   return {
     headerRow: true,
     striped: false,
-    colWidths: [145, 115, 200],
-    colAligns: ["left", "center", "left"],
-    rows: isZh
-      ? [
-          [createEmptyCell("项目"), createEmptyCell("状态"), createEmptyCell("说明")],
-          [
-            createEmptyCell("**核心功能**"),
-            { ...createEmptyCell("{c:green}**已完成**{/c}"), bg: "green" },
-            createEmptyCell("单元格支持 ==Markdown== 语法"),
-          ],
-          [
-            createEmptyCell("合并与样式"),
-            { ...createEmptyCell("{c:orange}进行中{/c}"), bg: "yellow" },
-            createEmptyCell("拖选多格可在左侧合并，底部/右侧 `+` 增行列"),
-          ],
-        ]
-      : [
-          [createEmptyCell("Item"), createEmptyCell("Status"), createEmptyCell("Notes")],
-          [
-            createEmptyCell("**Core feature**"),
-            { ...createEmptyCell("{c:green}**Done**{/c}"), bg: "green" },
-            createEmptyCell("Cells support ==Markdown== syntax"),
-          ],
-          [
-            createEmptyCell("Merge & Style"),
-            { ...createEmptyCell("{c:orange}WIP{/c}"), bg: "yellow" },
-            createEmptyCell("Drag cells to merge; edge `+` adds rows/cols"),
-          ],
-        ],
+    outerBorder: true,
+    colWidths: [140, 140, 140],
+    colAligns: ["left", "left", "left"],
+    rows: [
+      [createEmptyCell(""), createEmptyCell(""), createEmptyCell("")],
+      [createEmptyCell(""), createEmptyCell(""), createEmptyCell("")],
+      [createEmptyCell(""), createEmptyCell(""), createEmptyCell("")],
+    ],
   };
 }
 
@@ -198,6 +177,7 @@ export function normalizeTableData(raw) {
   return {
     headerRow: raw.headerRow !== false,
     striped: Boolean(raw.striped),
+    outerBorder: raw.outerBorder !== false,
     colWidths,
     colAligns,
     rows,

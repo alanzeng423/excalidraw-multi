@@ -13,6 +13,9 @@ import {
 import {
   HIGHLIGHT_COLOR_PALETTE,
   TEXT_COLOR_PALETTE,
+  appendMarkdownTableCol,
+  appendMarkdownTableRow,
+  hasMarkdownTable,
   measureNativeTextBox,
 } from "./nativeMarkdown";
 import {
@@ -93,6 +96,60 @@ function getTargetTextElements(api) {
     }
   }
   return result;
+}
+
+const BLANK_MD_TABLE = "|  |  |  |\n| --- | --- | --- |\n|  |  |  |\n|  |  |  |";
+
+function getSelectedNativeMdTableOverlay(api, nativeMd) {
+  if (!api || !nativeMd) return null;
+  const appState = api.getAppState();
+  if (
+    !appState ||
+    appState.viewModeEnabled ||
+    appState.editingTextElement ||
+    appState.draggingElement ||
+    appState.resizingElement ||
+    appState.selectionElement
+  ) {
+    return null;
+  }
+  const selectedIds = Object.entries(appState.selectedElementIds || {})
+    .filter(([, selected]) => Boolean(selected))
+    .map(([id]) => id);
+  if (selectedIds.length !== 1) return null;
+
+  const elements = api.getSceneElementsIncludingDeleted();
+  const el = elements.find((item) => item.id === selectedIds[0]);
+  if (!el || el.isDeleted || el.type !== "text") return null;
+  if (Math.abs(el.angle || 0) > 0.01) return null;
+
+  const raw = el.originalText ?? el.text ?? "";
+  if (!hasMarkdownTable(raw)) return null;
+
+  const zoom = appState.zoom?.value || 1;
+  const left = (el.x + (appState.scrollX || 0)) * zoom + (appState.offsetLeft || 0);
+  const top = (el.y + (appState.scrollY || 0)) * zoom + (appState.offsetTop || 0);
+  const width = (el.width || 0) * zoom;
+  const height = (el.height || 0) * zoom;
+
+  if (
+    width < 28 ||
+    height < 24 ||
+    left + width < 0 ||
+    top + height < 0 ||
+    left > window.innerWidth ||
+    top > window.innerHeight
+  ) {
+    return null;
+  }
+
+  return {
+    elementId: el.id,
+    left,
+    top,
+    width,
+    height,
+  };
 }
 
 function getSelectedTableElement(api) {
@@ -221,6 +278,11 @@ export default function TextStylePanel({
   const [isEditingText, setIsEditingText] = useState(false);
   const [activeCjkFont, setActiveCjkFont] = useState(() => getDefaultCjkFontId());
   const [cjkPopover, setCjkPopover] = useState(null); // { top, left } | null
+  const [mdTableState, setMdTableState] = useState({
+    hasTable: false,
+    outerBorder: true,
+  });
+  const [mdTableOverlay, setMdTableOverlay] = useState(null);
 
   const cjkBtnHostRef = useRef(null);
   const styleHostRef = useRef(null);
@@ -251,16 +313,35 @@ export default function TextStylePanel({
       lastSelRef.current = { start, end };
       setIsEditingText(true);
       setActive(detectActiveFormats(ta.value, start, end));
+      setMdTableState({
+        hasTable: hasMarkdownTable(ta.value),
+        outerBorder:
+          textEls.length > 0
+            ? textEls[0].customData?.tableOuterBorder !== false
+            : true,
+      });
+      setMdTableOverlay(null);
       return;
     }
     setIsEditingText(false);
     if (textEls.length > 0) {
       const raw = textEls[0].originalText ?? textEls[0].text ?? "";
       setActive(detectActiveFormats(raw, 0, raw.length));
+      const anyTable = textEls.some((el) =>
+        hasMarkdownTable(el.originalText ?? el.text ?? "")
+      );
+      setMdTableState({
+        hasTable: anyTable,
+        outerBorder: textEls[0].customData?.tableOuterBorder !== false,
+      });
     } else {
       setActive(EMPTY_ACTIVE);
+      setMdTableState({ hasTable: false, outerBorder: true });
     }
-  }, [api]);
+    setMdTableOverlay(
+      readOnly ? null : getSelectedNativeMdTableOverlay(api, nativeMd)
+    );
+  }, [api, nativeMd, readOnly]);
 
   const syncPortalHosts = useCallback(() => {
     if (readOnly) {
@@ -355,6 +436,17 @@ export default function TextStylePanel({
     const unsubApi = api?.onChange?.(() => {
       scheduleSync();
     });
+    const unsubScroll = api?.onScrollChange?.(() => {
+      setMdTableOverlay(
+        readOnly ? null : getSelectedNativeMdTableOverlay(api, nativeMd)
+      );
+    });
+    const onResize = () => {
+      setMdTableOverlay(
+        readOnly ? null : getSelectedNativeMdTableOverlay(api, nativeMd)
+      );
+    };
+    window.addEventListener("resize", onResize);
 
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
@@ -364,7 +456,9 @@ export default function TextStylePanel({
       document.removeEventListener("mouseup", onSelEvent, true);
       document.removeEventListener("input", onSelEvent, true);
       document.removeEventListener("focusin", scheduleSync, true);
+      window.removeEventListener("resize", onResize);
       unsubApi?.();
+      unsubScroll?.();
       cjkBtnHostRef.current?.remove();
       cjkBtnHostRef.current = null;
       styleHostRef.current?.remove();
@@ -372,7 +466,7 @@ export default function TextStylePanel({
       tableHostRef.current?.remove();
       tableHostRef.current = null;
     };
-  }, [api, syncPortalHosts, refreshActiveState]);
+  }, [api, nativeMd, readOnly, syncPortalHosts, refreshActiveState]);
 
   // Close floating Chinese font popover on outside click or Escape
   useEffect(() => {
@@ -577,9 +671,7 @@ export default function TextStylePanel({
 
         let res;
         if (action.type === "insert-md-table") {
-          const tpl = isZh
-            ? "| 列1 | 列2 | 列3 |\n| --- | :---: | ---: |\n| 内容 | **重点** | ==高亮== |\n| 示例 | {c:red}红色{/c} | 备注 |"
-            : "| Col 1 | Col 2 | Col 3 |\n| --- | :---: | ---: |\n| Item | **Bold** | ==Note== |\n| Row | {c:red}Red{/c} | Info |";
+          const tpl = BLANK_MD_TABLE;
           const before = ta.value.slice(0, clampedStart);
           const after = ta.value.slice(clampedEnd);
           const prefixNl = before && !before.endsWith("\n") ? "\n" : "";
@@ -587,9 +679,15 @@ export default function TextStylePanel({
           const inserted = `${prefixNl}${tpl}${suffixNl}`;
           res = {
             text: before + inserted + after,
-            start: clampedStart + prefixNl.length,
-            end: clampedStart + prefixNl.length + tpl.length,
+            start: clampedStart + prefixNl.length + 2,
+            end: clampedStart + prefixNl.length + 2,
           };
+        } else if (action.type === "md-table-add-row") {
+          const next = appendMarkdownTableRow(ta.value);
+          res = { text: next, start: next.length, end: next.length };
+        } else if (action.type === "md-table-add-col") {
+          const next = appendMarkdownTableCol(ta.value);
+          res = { text: next, start: next.length, end: next.length };
         } else if (action.type === "block") {
           res = applyBlockFormat(ta.value, clampedStart, clampedEnd, action.kind);
         } else if (action.type === "inline") {
@@ -635,10 +733,13 @@ export default function TextStylePanel({
         const currentRaw = el.originalText ?? el.text ?? "";
         let nextRaw;
         if (action.type === "insert-md-table") {
-          const tpl = isZh
-            ? "| 列1 | 列2 | 列3 |\n| --- | :---: | ---: |\n| 内容 | **重点** | ==高亮== |\n| 示例 | {c:red}红色{/c} | 备注 |"
-            : "| Col 1 | Col 2 | Col 3 |\n| --- | :---: | ---: |\n| Item | **Bold** | ==Note== |\n| Row | {c:red}Red{/c} | Info |";
-          nextRaw = currentRaw.trim() ? `${currentRaw}\n${tpl}` : tpl;
+          nextRaw = currentRaw.trim()
+            ? `${currentRaw}\n${BLANK_MD_TABLE}`
+            : BLANK_MD_TABLE;
+        } else if (action.type === "md-table-add-row") {
+          nextRaw = appendMarkdownTableRow(currentRaw);
+        } else if (action.type === "md-table-add-col") {
+          nextRaw = appendMarkdownTableCol(currentRaw);
         } else {
           nextRaw = applyFormatToWholeText(currentRaw, action);
         }
@@ -703,10 +804,34 @@ export default function TextStylePanel({
           : nextElements;
 
       api.updateScene({ elements: finalElements });
+      refreshActiveState();
       requestAnimationFrame(refreshActiveState);
     },
-    [api, isZh, nativeMd, onEnsureNativeMd, readOnly, refreshActiveState]
+    [api, nativeMd, onEnsureNativeMd, readOnly, refreshActiveState]
   );
+
+  const toggleNativeMdTableOuterBorder = useCallback(() => {
+    if (readOnly || !api) return;
+    const targetTextEls = getTargetTextElements(api);
+    if (targetTextEls.length === 0) return;
+    const nextOuter = targetTextEls[0].customData?.tableOuterBorder === false;
+    const targetIds = new Set(targetTextEls.map((el) => el.id));
+    const allElements = api.getSceneElementsIncludingDeleted();
+    const nextElements = allElements.map((el) => {
+      if (!targetIds.has(el.id) || el.isDeleted) return el;
+      return {
+        ...el,
+        customData: { ...(el.customData || {}), tableOuterBorder: nextOuter },
+        version: (el.version || 0) + 1,
+        versionNonce: Math.floor(Math.random() * 2147483647),
+        updated: Date.now(),
+      };
+    });
+    api.updateScene({ elements: nextElements });
+    api.refresh?.();
+    setMdTableState((prev) => ({ ...prev, outerBorder: nextOuter }));
+    requestAnimationFrame(refreshActiveState);
+  }, [api, readOnly, refreshActiveState]);
 
   // ===== Table Panel Actions (act on selected Table Card & its active range) =====
   const activeTable = selectedTableEl
@@ -730,8 +855,10 @@ export default function TextStylePanel({
           editingCell: null,
         });
       }
+      refreshActiveState();
+      requestAnimationFrame(refreshActiveState);
     },
-    [selectedTableEl, onUpdateTable]
+    [selectedTableEl, onUpdateTable, refreshActiveState]
   );
 
   const patchSelectedTableCells = useCallback(
@@ -1157,6 +1284,47 @@ export default function TextStylePanel({
               </button>
             </div>
 
+            {mdTableState.hasTable && (
+              <>
+                <div className="md-style-sublabel">
+                  {isZh ? "Markdown 表格" : "Markdown table"}
+                </div>
+                <div className="md-tbl-grid-3">
+                  <button
+                    type="button"
+                    className={`md-style-btn ${mdTableState.outerBorder ? "active" : ""}`}
+                    title={
+                      isZh
+                        ? "显示或隐藏表格最外圈边框线"
+                        : "Show or hide outer table border"
+                    }
+                    onMouseDown={preventBlur}
+                    onClick={toggleNativeMdTableOuterBorder}
+                  >
+                    {isZh ? "外框" : "Border"}
+                  </button>
+                  <button
+                    type="button"
+                    className="md-style-btn"
+                    title={isZh ? "表格底部加一行" : "Add row to table"}
+                    onMouseDown={preventBlur}
+                    onClick={() => applyTextAction({ type: "md-table-add-row" })}
+                  >
+                    {isZh ? "+行" : "+Row"}
+                  </button>
+                  <button
+                    type="button"
+                    className="md-style-btn"
+                    title={isZh ? "表格右侧加一列" : "Add column to table"}
+                    onMouseDown={preventBlur}
+                    onClick={() => applyTextAction({ type: "md-table-add-col" })}
+                  >
+                    {isZh ? "+列" : "+Col"}
+                  </button>
+                </div>
+              </>
+            )}
+
             {isEditingText && (
               <div className="md-style-hint">
                 {isZh ? "拖选部分文字可单独改色/高亮" : "Select text to color or highlight"}
@@ -1237,11 +1405,7 @@ export default function TextStylePanel({
                 onMouseDown={preventBlur}
                 onClick={() => {
                   const colIdx = currentRange.c2 + 1;
-                  const next = insertColAt(
-                    activeTable,
-                    colIdx,
-                    isZh ? `列 ${colIdx + 1}` : `Col ${colIdx + 1}`
-                  );
+                  const next = insertColAt(activeTable, colIdx, "");
                   commitTable(next, {
                     r1: currentRange.r1,
                     c1: colIdx,
@@ -1311,8 +1475,26 @@ export default function TextStylePanel({
               </button>
             </div>
 
-            {/* Header / Stripe / Alignment */}
-            <div className="md-tbl-grid-5">
+            {/* Outer Border / Header / Stripe */}
+            <div className="md-tbl-grid-3">
+              <button
+                type="button"
+                className={`md-style-btn ${activeTable.outerBorder !== false ? "active" : ""}`}
+                title={
+                  isZh
+                    ? "显示或隐藏表格最外圈边框线"
+                    : "Show or hide outer table border"
+                }
+                onMouseDown={preventBlur}
+                onClick={() =>
+                  commitTable({
+                    ...activeTable,
+                    outerBorder: activeTable.outerBorder === false,
+                  })
+                }
+              >
+                {isZh ? "外框" : "Border"}
+              </button>
               <button
                 type="button"
                 className={`md-style-btn ${activeTable.headerRow ? "active" : ""}`}
@@ -1335,16 +1517,20 @@ export default function TextStylePanel({
               >
                 {isZh ? "斑马" : "Alt"}
               </button>
+            </div>
+
+            {/* Column Alignment */}
+            <div className="md-tbl-grid-3">
               {[
-                { id: "left", zh: "左", en: "L" },
-                { id: "center", zh: "中", en: "C" },
-                { id: "right", zh: "右", en: "R" },
+                { id: "left", zh: "左对齐", en: "Left" },
+                { id: "center", zh: "居中", en: "Center" },
+                { id: "right", zh: "右对齐", en: "Right" },
               ].map((a) => (
                 <button
                   key={a.id}
                   type="button"
                   className={`md-style-btn ${activeColAlign === a.id ? "active" : ""}`}
-                  title={isZh ? `列${a.zh}对齐` : `Align ${a.id}`}
+                  title={isZh ? `列${a.zh}` : `Align ${a.id}`}
                   onMouseDown={preventBlur}
                   onClick={() => {
                     const nextAligns = activeTable.colAligns.map((cur, ci) =>
@@ -1498,6 +1684,52 @@ export default function TextStylePanel({
             </div>
           </fieldset>,
           tableHostEl
+        )}
+
+      {/* 4. Feishu-style bottom '+' & right '+' edge rails for selected Native Markdown Table */}
+      {mdTableOverlay &&
+        createPortal(
+          <>
+            <button
+              type="button"
+              className={`md-tbl-edge-btn is-row ${isDarkTheme ? "is-dark" : ""}`}
+              style={{
+                left: `${mdTableOverlay.left}px`,
+                top: `${mdTableOverlay.top + mdTableOverlay.height + 14}px`,
+                width: `${Math.max(44, mdTableOverlay.width)}px`,
+              }}
+              title={isZh ? "在 Markdown 表格底部添加一行" : "Add row to Markdown table"}
+              aria-label={isZh ? "Markdown 表格底部添加行" : "Add row to Markdown table"}
+              onPointerDown={(e) => e.stopPropagation()}
+              onMouseDown={preventBlur}
+              onClick={(e) => {
+                e.stopPropagation();
+                applyTextAction({ type: "md-table-add-row" });
+              }}
+            >
+              +
+            </button>
+            <button
+              type="button"
+              className={`md-tbl-edge-btn is-col ${isDarkTheme ? "is-dark" : ""}`}
+              style={{
+                left: `${mdTableOverlay.left + mdTableOverlay.width + 14}px`,
+                top: `${mdTableOverlay.top}px`,
+                height: `${Math.max(36, mdTableOverlay.height)}px`,
+              }}
+              title={isZh ? "在 Markdown 表格右侧添加一列" : "Add column to Markdown table"}
+              aria-label={isZh ? "Markdown 表格右侧添加列" : "Add column to Markdown table"}
+              onPointerDown={(e) => e.stopPropagation()}
+              onMouseDown={preventBlur}
+              onClick={(e) => {
+                e.stopPropagation();
+                applyTextAction({ type: "md-table-add-col" });
+              }}
+            >
+              +
+            </button>
+          </>,
+          document.body
         )}
     </>
   );

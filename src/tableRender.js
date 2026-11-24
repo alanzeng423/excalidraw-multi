@@ -503,6 +503,20 @@ export function appendSvgTable(doc, svgNS, group, element) {
   const inner = doc.createElementNS(svgNS, "g");
   inner.setAttribute("clip-path", `url(#${clipId})`);
 
+  const cardBg =
+    element.backgroundColor && element.backgroundColor !== "transparent"
+      ? element.backgroundColor
+      : null;
+  if (cardBg) {
+    const bgRect = doc.createElementNS(svgNS, "rect");
+    bgRect.setAttribute("x", "0");
+    bgRect.setAttribute("y", "0");
+    bgRect.setAttribute("width", String(w));
+    bgRect.setAttribute("height", String(h));
+    bgRect.setAttribute("fill", cardBg);
+    inner.appendChild(bgRect);
+  }
+
   for (let r = 0; r < rowCount; r += 1) {
     const y = rowY[r];
     if (y > h) break;
@@ -601,22 +615,52 @@ export function appendSvgTable(doc, svgNS, group, element) {
     }
   }
 
-  // Internal gridlines (respecting merged cells)
+  // Internal gridlines (respecting merged cells & native roughness)
   const gridBottom = Math.min(h, rowY[rowCount]);
+  const roughness = Number.isFinite(element.roughness) ? element.roughness : 1;
+  const seed = (element.seed || 1) + 73;
+  const strokeDashArr =
+    element.strokeStyle === "dashed"
+      ? [8, 6]
+      : element.strokeStyle === "dotted"
+        ? [2, 5]
+        : undefined;
+  const gen = roughness > 0 ? rough.generator() : null;
+
   const appendLine = (x1, y1, x2, y2, emphasized = false) => {
-    const line = doc.createElementNS(svgNS, "line");
-    line.setAttribute("x1", String(x1));
-    line.setAttribute("y1", String(y1));
-    line.setAttribute("x2", String(x2));
-    line.setAttribute("y2", String(y2));
-    line.setAttribute("stroke", strokeColor);
-    line.setAttribute("stroke-opacity", emphasized ? "0.9" : "0.72");
-    line.setAttribute(
-      "stroke-width",
-      String(emphasized ? Math.max(1.5, baseWidth * 1.25) : baseWidth)
-    );
-    if (strokeDash) line.setAttribute("stroke-dasharray", strokeDash);
-    inner.appendChild(line);
+    const sw = emphasized ? Math.max(1.5, baseWidth * 1.25) : baseWidth;
+    if (gen) {
+      const drawable = gen.line(x1, y1, x2, y2, {
+        stroke: strokeColor,
+        strokeWidth: sw,
+        roughness: roughness * 0.72,
+        bowing: 0.7,
+        seed,
+        strokeLineDash: strokeDashArr,
+        disableMultiStroke: true,
+      });
+      for (const p of gen.toPaths(drawable)) {
+        const path = doc.createElementNS(svgNS, "path");
+        path.setAttribute("d", p.d);
+        path.setAttribute("fill", "none");
+        path.setAttribute("stroke", p.stroke || strokeColor);
+        path.setAttribute("stroke-width", String(p.strokeWidth || sw));
+        path.setAttribute("stroke-linecap", "round");
+        if (strokeDash) path.setAttribute("stroke-dasharray", strokeDash);
+        inner.appendChild(path);
+      }
+    } else {
+      const line = doc.createElementNS(svgNS, "line");
+      line.setAttribute("x1", String(x1));
+      line.setAttribute("y1", String(y1));
+      line.setAttribute("x2", String(x2));
+      line.setAttribute("y2", String(y2));
+      line.setAttribute("stroke", strokeColor);
+      line.setAttribute("stroke-opacity", emphasized ? "0.9" : "0.72");
+      line.setAttribute("stroke-width", String(sw));
+      if (strokeDash) line.setAttribute("stroke-dasharray", strokeDash);
+      inner.appendChild(line);
+    }
   };
 
   for (let r = 1; r < rowCount; r += 1) {

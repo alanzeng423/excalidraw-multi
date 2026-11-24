@@ -455,8 +455,8 @@ function BoardCanvas({ id }) {
     if (!api || readOnlyRef.current) return;
     const appState = api.getAppState();
     const zoom = appState.zoom?.value || 1;
-    const cardW = 480;
-    const cardH = 188;
+    const cardW = 420;
+    const cardH = 156;
     const centerX = -appState.scrollX + appState.width / (2 * zoom);
     const centerY = -appState.scrollY + appState.height / (2 * zoom);
 
@@ -474,12 +474,12 @@ function BoardCanvas({ id }) {
           backgroundColor: "transparent",
           strokeWidth: 1.5,
           roughness: 1,
-          roundness: { type: 3, value: 8 },
+          roundness: null,
           fontFamily: appState.currentItemFontFamily || 5,
           customData: {
             type: "table",
             cjkFont: getDefaultCjkFontId(),
-            table: createDefaultTable(langCode === "zh-CN"),
+            table: createDefaultTable(),
           },
         },
       ],

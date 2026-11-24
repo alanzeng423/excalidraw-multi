@@ -1,3 +1,5 @@
+import rough from "roughjs";
+
 const STORAGE_KEY = "excalidraw-multi:native-md";
 
 const HEADING_SCALES = { 1: 1.38, 2: 1.22, 3: 1.1 };
@@ -628,6 +630,73 @@ export function parseMarkdownBlocks(lines) {
   return blocks;
 }
 
+function findMarkdownTableRanges(lines) {
+  const ranges = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = String(lines[i] ?? "");
+    if (
+      i + 1 < lines.length &&
+      line.includes("|") &&
+      isMarkdownTableSeparator(lines[i + 1])
+    ) {
+      let j = i + 2;
+      while (j < lines.length) {
+        const nextLine = String(lines[j] ?? "");
+        if (!nextLine.trim() || !nextLine.includes("|")) break;
+        j += 1;
+      }
+      ranges.push({ start: i, end: j });
+      i = j;
+      continue;
+    }
+    i += 1;
+  }
+  return ranges;
+}
+
+export function hasMarkdownTable(text) {
+  const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+  return findMarkdownTableRanges(lines).length > 0;
+}
+
+function serializeMarkdownTableRow(cells) {
+  return `| ${cells.map((c) => String(c ?? "").replace(/\|/g, "\\|")).join(" | ")} |`;
+}
+
+export function appendMarkdownTableRow(text) {
+  const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const ranges = findMarkdownTableRanges(lines);
+  if (ranges.length === 0) return String(text ?? "");
+  const last = ranges[ranges.length - 1];
+  let colCount = 1;
+  for (let idx = last.start; idx < last.end; idx += 1) {
+    colCount = Math.max(colCount, splitMarkdownTableRow(lines[idx]).length);
+  }
+  const emptyRow = serializeMarkdownTableRow(Array(colCount).fill(""));
+  lines.splice(last.end, 0, emptyRow);
+  return lines.join("\n");
+}
+
+export function appendMarkdownTableCol(text) {
+  const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const ranges = findMarkdownTableRanges(lines);
+  if (ranges.length === 0) return String(text ?? "");
+  const last = ranges[ranges.length - 1];
+  let colCount = 1;
+  for (let idx = last.start; idx < last.end; idx += 1) {
+    colCount = Math.max(colCount, splitMarkdownTableRow(lines[idx]).length);
+  }
+  for (let idx = last.start; idx < last.end; idx += 1) {
+    const isSep = idx === last.start + 1;
+    const cells = splitMarkdownTableRow(lines[idx]);
+    while (cells.length < colCount) cells.push(isSep ? "---" : "");
+    cells.push(isSep ? "---" : "");
+    lines[idx] = serializeMarkdownTableRow(cells);
+  }
+  return lines.join("\n");
+}
+
 function measureSpansList(ctx, spans, fontSize, fontFamily) {
   let total = 0;
   const spanMetrics = [];
@@ -645,7 +714,7 @@ function measureSpansList(ctx, spans, fontSize, fontFamily) {
 function measureMarkdownTable(ctx, block, fontSize, fontFamily, lineHeightPx) {
   const padX = Math.max(8, fontSize * 0.55);
   const rowH = Math.max(lineHeightPx * 1.28, fontSize * 1.65);
-  const colWidths = Array(block.colCount).fill(Math.max(40, fontSize * 2.4));
+  const colWidths = Array(block.colCount).fill(Math.max(56, fontSize * 3.2));
   const cellMetrics = [];
 
   for (let r = 0; r < block.rows.length; r += 1) {
@@ -707,7 +776,7 @@ function measureLineWidth(ctx, line, fontStr, isTestEnv) {
     let total = 0;
     for (const c of cells) {
       const m = measureSpansList(ctx, parseInlineSpans(c), fontSize, fontFamily);
-      total += Math.max(Math.max(40, fontSize * 2.4), m.totalWidth + padX * 2);
+      total += Math.max(Math.max(56, fontSize * 3.2), m.totalWidth + padX * 2);
     }
     return isTestEnv ? total * 10 : total;
   }
@@ -841,48 +910,89 @@ function drawCanvasText(ctx, element, rawLines, opts) {
       }
       const tableY = cursorY + tm.marginY;
       const tableH = block.rows.length * tm.rowH;
-      const radius = Math.min(6, fontSize * 0.28);
+      const showOuter = element.customData?.tableOuterBorder !== false;
+      const strokeColor =
+        element.strokeColor && element.strokeColor !== "transparent"
+          ? element.strokeColor
+          : "#1e1e1e";
+      const baseWidth = Math.max(1.1, Math.min(2.4, fontSize * 0.075));
+      const roughness = Number.isFinite(element.roughness) ? element.roughness : 1;
+      const seed = (element.seed || 1) + 73;
+      const rc = roughness > 0 && ctx.canvas ? rough.canvas(ctx.canvas) : null;
 
       ctx.save();
       ctx.textAlign = "left";
 
-      // Clip inside rounded outer box for header fill
-      ctx.save();
-      drawRoundedRect(ctx, tableX, tableY, tm.totalWidth, tableH, radius);
-      ctx.clip();
-      ctx.fillStyle = "rgba(105, 101, 219, 0.09)";
+      // Sharp-cornered header fill (matching interactive TableCard)
+      ctx.fillStyle = "rgba(105, 101, 219, 0.08)";
       ctx.fillRect(tableX, tableY, tm.totalWidth, tm.rowH);
-      ctx.restore();
 
-      // Grid lines
-      ctx.strokeStyle = element.strokeColor;
-      ctx.lineWidth = Math.max(1, fontSize * 0.06);
-      ctx.globalAlpha = (ctx.globalAlpha ?? 1) * 0.42;
-      ctx.beginPath();
+      // Native Excalidraw roughjs (or crisp architect) table lines
+      const drawSeg = (x1, y1, x2, y2, sw, alpha = 0.72) => {
+        if (rc) {
+          rc.line(x1, y1, x2, y2, {
+            stroke: strokeColor,
+            strokeWidth: sw,
+            roughness: roughness * 0.72,
+            bowing: 0.7,
+            seed,
+            disableMultiStroke: true,
+          });
+        } else {
+          ctx.save();
+          ctx.strokeStyle = strokeColor;
+          ctx.lineWidth = sw;
+          ctx.globalAlpha = (ctx.globalAlpha ?? 1) * alpha;
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+          ctx.restore();
+        }
+      };
+
+      // Internal horizontal dividers (header separator emphasized)
       for (let r = 1; r < block.rows.length; r += 1) {
         const ly = tableY + r * tm.rowH;
-        ctx.moveTo(tableX, ly);
-        ctx.lineTo(tableX + tm.totalWidth, ly);
+        const isHeaderEdge = r === 1;
+        drawSeg(
+          tableX,
+          ly,
+          tableX + tm.totalWidth,
+          ly,
+          isHeaderEdge ? Math.max(1.5, baseWidth * 1.25) : baseWidth,
+          isHeaderEdge ? 0.9 : 0.72
+        );
       }
+
+      // Internal vertical dividers
       let cx = tableX;
       for (let c = 0; c < block.colCount - 1; c += 1) {
         cx += tm.colWidths[c];
-        ctx.moveTo(cx, tableY);
-        ctx.lineTo(cx, tableY + tableH);
+        drawSeg(cx, tableY, cx, tableY + tableH, baseWidth, 0.72);
       }
-      ctx.stroke();
 
-      // Emphasized outer border & header separator
-      ctx.globalAlpha = 0.72;
-      drawRoundedRect(ctx, tableX, tableY, tm.totalWidth, tableH, radius);
-      ctx.stroke();
-      if (block.rows.length > 1) {
-        ctx.beginPath();
-        ctx.moveTo(tableX, tableY + tm.rowH);
-        ctx.lineTo(tableX + tm.totalWidth, tableY + tm.rowH);
-        ctx.stroke();
+      // Outer sharp-cornered border (toggleable via customData.tableOuterBorder)
+      if (showOuter) {
+        const outerSw = Math.max(1.4, baseWidth * 1.15);
+        if (rc) {
+          rc.rectangle(tableX, tableY, tm.totalWidth, tableH, {
+            stroke: strokeColor,
+            strokeWidth: outerSw,
+            roughness: roughness * 0.78,
+            bowing: 0.7,
+            seed,
+            disableMultiStroke: true,
+          });
+        } else {
+          ctx.save();
+          ctx.strokeStyle = strokeColor;
+          ctx.lineWidth = outerSw;
+          ctx.globalAlpha = (ctx.globalAlpha ?? 1) * 0.88;
+          ctx.strokeRect(tableX, tableY, tm.totalWidth, tableH);
+          ctx.restore();
+        }
       }
-      ctx.globalAlpha = 1;
 
       // Cell rich text
       for (let r = 0; r < block.rows.length; r += 1) {
@@ -1094,56 +1204,109 @@ function appendSvgText(doc, svgNS, group, element, rawLines, opts) {
       }
       const tableY = cursorY + tm.marginY;
       const tableH = block.rows.length * tm.rowH;
-      const radius = Math.min(6, fontSize * 0.28);
-      const sw = Math.max(1, fontSize * 0.06);
+      const showOuter = element.customData?.tableOuterBorder !== false;
+      const strokeColor =
+        element.strokeColor && element.strokeColor !== "transparent"
+          ? element.strokeColor
+          : "#1e1e1e";
+      const baseWidth = Math.max(1.1, Math.min(2.4, fontSize * 0.075));
+      const roughness = Number.isFinite(element.roughness) ? element.roughness : 1;
+      const seed = (element.seed || 1) + 73;
+      const gen = roughness > 0 ? rough.generator() : null;
 
       const headerBg = doc.createElementNS(svgNS, "rect");
       headerBg.setAttribute("x", String(tableX));
       headerBg.setAttribute("y", String(tableY));
       headerBg.setAttribute("width", String(tm.totalWidth));
       headerBg.setAttribute("height", String(tm.rowH));
-      headerBg.setAttribute("rx", String(radius));
-      headerBg.setAttribute("fill", "rgba(105, 101, 219, 0.09)");
+      headerBg.setAttribute("fill", "rgba(105, 101, 219, 0.08)");
       group.appendChild(headerBg);
 
+      const appendRough = (drawable, sw) => {
+        for (const p of gen.toPaths(drawable)) {
+          const path = doc.createElementNS(svgNS, "path");
+          path.setAttribute("d", p.d);
+          path.setAttribute("fill", p.fill || "none");
+          path.setAttribute("stroke", p.stroke || strokeColor);
+          path.setAttribute("stroke-width", String(p.strokeWidth || sw));
+          path.setAttribute("stroke-linecap", "round");
+          path.setAttribute("stroke-linejoin", "round");
+          group.appendChild(path);
+        }
+      };
+
+      const appendSeg = (x1, y1, x2, y2, sw, opacity) => {
+        if (gen) {
+          appendRough(
+            gen.line(x1, y1, x2, y2, {
+              stroke: strokeColor,
+              strokeWidth: sw,
+              roughness: roughness * 0.72,
+              bowing: 0.7,
+              seed,
+              disableMultiStroke: true,
+            }),
+            sw
+          );
+        } else {
+          const line = doc.createElementNS(svgNS, "line");
+          line.setAttribute("x1", String(x1));
+          line.setAttribute("y1", String(y1));
+          line.setAttribute("x2", String(x2));
+          line.setAttribute("y2", String(y2));
+          line.setAttribute("stroke", strokeColor);
+          line.setAttribute("stroke-opacity", String(opacity));
+          line.setAttribute("stroke-width", String(sw));
+          group.appendChild(line);
+        }
+      };
+
       for (let r = 1; r < block.rows.length; r += 1) {
-        const line = doc.createElementNS(svgNS, "line");
         const ly = tableY + r * tm.rowH;
-        line.setAttribute("x1", String(tableX));
-        line.setAttribute("y1", String(ly));
-        line.setAttribute("x2", String(tableX + tm.totalWidth));
-        line.setAttribute("y2", String(ly));
-        line.setAttribute("stroke", element.strokeColor);
-        line.setAttribute("stroke-opacity", r === 1 ? "0.72" : "0.42");
-        line.setAttribute("stroke-width", String(sw));
-        group.appendChild(line);
+        const isHeaderEdge = r === 1;
+        appendSeg(
+          tableX,
+          ly,
+          tableX + tm.totalWidth,
+          ly,
+          isHeaderEdge ? Math.max(1.5, baseWidth * 1.25) : baseWidth,
+          isHeaderEdge ? 0.9 : 0.72
+        );
       }
 
       let cx = tableX;
       for (let c = 0; c < block.colCount - 1; c += 1) {
         cx += tm.colWidths[c];
-        const line = doc.createElementNS(svgNS, "line");
-        line.setAttribute("x1", String(cx));
-        line.setAttribute("y1", String(tableY));
-        line.setAttribute("x2", String(cx));
-        line.setAttribute("y2", String(tableY + tableH));
-        line.setAttribute("stroke", element.strokeColor);
-        line.setAttribute("stroke-opacity", "0.42");
-        line.setAttribute("stroke-width", String(sw));
-        group.appendChild(line);
+        appendSeg(cx, tableY, cx, tableY + tableH, baseWidth, 0.72);
       }
 
-      const outer = doc.createElementNS(svgNS, "rect");
-      outer.setAttribute("x", String(tableX));
-      outer.setAttribute("y", String(tableY));
-      outer.setAttribute("width", String(tm.totalWidth));
-      outer.setAttribute("height", String(tableH));
-      outer.setAttribute("rx", String(radius));
-      outer.setAttribute("fill", "none");
-      outer.setAttribute("stroke", element.strokeColor);
-      outer.setAttribute("stroke-opacity", "0.72");
-      outer.setAttribute("stroke-width", String(sw));
-      group.appendChild(outer);
+      if (showOuter) {
+        const outerSw = Math.max(1.4, baseWidth * 1.15);
+        if (gen) {
+          appendRough(
+            gen.rectangle(tableX, tableY, tm.totalWidth, tableH, {
+              stroke: strokeColor,
+              strokeWidth: outerSw,
+              roughness: roughness * 0.78,
+              bowing: 0.7,
+              seed,
+              disableMultiStroke: true,
+            }),
+            outerSw
+          );
+        } else {
+          const outer = doc.createElementNS(svgNS, "rect");
+          outer.setAttribute("x", String(tableX));
+          outer.setAttribute("y", String(tableY));
+          outer.setAttribute("width", String(tm.totalWidth));
+          outer.setAttribute("height", String(tableH));
+          outer.setAttribute("fill", "none");
+          outer.setAttribute("stroke", strokeColor);
+          outer.setAttribute("stroke-opacity", "0.88");
+          outer.setAttribute("stroke-width", String(outerSw));
+          group.appendChild(outer);
+        }
+      }
 
       for (let r = 0; r < block.rows.length; r += 1) {
         const cellTop = tableY + r * tm.rowH;

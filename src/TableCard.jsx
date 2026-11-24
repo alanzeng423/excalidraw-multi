@@ -385,15 +385,11 @@ export default function TableCard({
 
   const handleAppendCol = useCallback(() => {
     const newC = table.colWidths.length;
-    const next = insertColAt(
-      table,
-      newC,
-      isZh ? `列 ${newC + 1}` : `Col ${newC + 1}`
-    );
+    const next = insertColAt(table, newC, "");
     commit(next);
     setRange({ r1: 0, c1: newC, r2: 0, c2: newC });
     setEditingCell({ r: 0, c: newC });
-  }, [table, commit, isZh]);
+  }, [table, commit]);
 
   const moveFocusTo = useCallback(
     (r, c, edit = true) => {
@@ -720,6 +716,7 @@ export default function TableCard({
         fontFamily: fontFamilyStr,
         backgroundColor: customBg,
         color: inkColor,
+        borderRadius: element.roundness ? "8px" : "0px",
       }}
       onWheel={isActive ? stop : undefined}
       onCopy={isActive ? stop : undefined}

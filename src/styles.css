@@ -1967,6 +1967,13 @@ body {
   width: 100%;
 }
 
+.md-tbl-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 3px;
+  width: 100%;
+}
+
 .md-tbl-grid-2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2350,4 +2357,50 @@ body {
   width: 18px;
   min-height: 100%;
   border-left: 1px dashed rgba(105, 101, 219, 0.25);
+}
+
+/* Feishu-style floating '+' edge rails for selected native text-box Markdown tables */
+.md-tbl-edge-btn {
+  position: fixed;
+  z-index: 4;
+  padding: 0;
+  border: 1px dashed rgba(105, 101, 219, 0.34);
+  border-radius: 4px;
+  background: rgba(105, 101, 219, 0.06);
+  color: #6965db;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.md-tbl-edge-btn:hover {
+  background: rgba(105, 101, 219, 0.18);
+  border-color: rgba(105, 101, 219, 0.65);
+  color: #443fc4;
+}
+
+.md-tbl-edge-btn.is-row {
+  height: 18px;
+}
+
+.md-tbl-edge-btn.is-col {
+  width: 18px;
+}
+
+.md-tbl-edge-btn.is-dark {
+  background: rgba(168, 165, 255, 0.09);
+  border-color: rgba(168, 165, 255, 0.34);
+  color: #a8a5ff;
+}
+
+.md-tbl-edge-btn.is-dark:hover {
+  background: rgba(168, 165, 255, 0.22);
+  border-color: rgba(168, 165, 255, 0.65);
+  color: #e4e3ff;
 }

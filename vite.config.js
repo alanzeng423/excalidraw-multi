@@ -245,11 +245,11 @@ function excalidrawCustomFontsPlugin() {
     }
     out = out.replace(
       canvasEmbedPattern,
-      `case"rectangle":case"iframe":case"embeddable":case"diamond":case"ellipse":{n.lineJoin="round",n.lineCap="round",t.draw(he.get(e));if(e.type==="embeddable"&&r?.isExporting&&e.customData?.type==="table"){globalThis.__EXCALIDRAW_TABLE__?.drawCanvasTable(n,e,o?.theme==="dark")}break}`
+      `case"rectangle":case"iframe":case"embeddable":case"diamond":case"ellipse":{n.lineJoin="round",n.lineCap="round";const _hideTblOuter=e.type==="embeddable"&&e.customData?.type==="table"&&e.customData?.table?.outerBorder===false;if(!_hideTblOuter)t.draw(he.get(e));if(e.type==="embeddable"&&r?.isExporting&&e.customData?.type==="table"){globalThis.__EXCALIDRAW_TABLE__?.drawCanvasTable(n,e,o?.theme==="dark")}break}`
     );
 
     const svgEmbedPattern =
-      /let S=Ii\(e\);wi\(S,t,n,g,o,S\.x\+d\.x-e\.x,S\.y\+d\.y-e\.y,s\);let v=jr\(n,y,qn\);for\(v\.setAttribute\("stroke-linecap","round"\),v\.setAttribute\("transform",`translate\(\$\{i\|\|0\} \$\{a\|\|0\}\) rotate\(\$\{E\} \$\{m\} \$\{b\}\)`\);v\.firstChild;\)v\.removeChild\(v\.firstChild\);let D=it\(Math\.min\(e\.width,e\.height\),e\),\$\=V2\(T2\(e\.link\|\|""\)\);if\(s\.renderEmbeddables===!1\|\|\$\?\.type==="document"\)\{let N=r\.ownerDocument\.createElementNS\(re,"a"\);/;
+      /h\(w,e\);let S=Ii\(e\);wi\(S,t,n,g,o,S\.x\+d\.x-e\.x,S\.y\+d\.y-e\.y,s\);let v=jr\(n,y,qn\);for\(v\.setAttribute\("stroke-linecap","round"\),v\.setAttribute\("transform",`translate\(\$\{i\|\|0\} \$\{a\|\|0\}\) rotate\(\$\{E\} \$\{m\} \$\{b\}\)`\);v\.firstChild;\)v\.removeChild\(v\.firstChild\);let D=it\(Math\.min\(e\.width,e\.height\),e\),\$\=V2\(T2\(e\.link\|\|""\)\);if\(s\.renderEmbeddables===!1\|\|\$\?\.type==="document"\)\{let N=r\.ownerDocument\.createElementNS\(re,"a"\);/;
     if (!svgEmbedPattern.test(out)) {
       throw new Error("Could not find Excalidraw SVG embeddable branch to patch");
     }
@@ -258,8 +258,8 @@ function excalidrawCustomFontsPlugin() {
       (orig) =>
         orig
           .replace(
-            `let S=Ii(e);wi(S,t,n,g,o,S.x+d.x-e.x,S.y+d.y-e.y,s);`,
-            `if(e.customData?.type!=="table"){let S=Ii(e);wi(S,t,n,g,o,S.x+d.x-e.x,S.y+d.y-e.y,s);}`
+            `h(w,e);let S=Ii(e);wi(S,t,n,g,o,S.x+d.x-e.x,S.y+d.y-e.y,s);`,
+            `(e.customData?.type==="table"&&e.customData?.table?.outerBorder===false?void 0:h(w,e));if(e.customData?.type!=="table"){let S=Ii(e);wi(S,t,n,g,o,S.x+d.x-e.x,S.y+d.y-e.y,s);}`
           )
           .replace(
             `if(s.renderEmbeddables===!1||$?.type==="document"){let N=r.ownerDocument.createElementNS(re,"a");`,
