@@ -136,6 +136,33 @@ function excalidrawCustomFontsPlugin() {
   ).join("");
 
   const patchCode = (code) => {
+    // Patch Excalidraw wysiwyg focus/blur guards in index.js so LiveMarkdownEditor (.md-live-editor-root)
+    // can edit rich Markdown/tables in real time without the hidden textarea stealing focus.
+    if (code.includes("excalidraw-wysiwyg")) {
+      let out = code;
+      const kPattern =
+        /k=F=>\{window\.removeEventListener\("pointerup",k\);let O=F\?\.target,j=O instanceof HTMLElement&&O\.classList\.contains\("properties-trigger"\);setTimeout\(\(\)=>\{d\.onblur=I,j\|\|d\.focus\(\)\}\)\}/;
+      const mPattern =
+        /let j=O instanceof HTMLElement&&O\.classList\.contains\("properties-trigger"\);/;
+      const nPattern =
+        /N=l\.scene\.onUpdate\(\(\)=>\{m\(\),!!document\.activeElement\?\.closest\("\.properties-content"\)\|\|d\.focus\(\)\}\)/;
+      if (kPattern.test(out) && mPattern.test(out) && nPattern.test(out)) {
+        out = out.replace(
+          kPattern,
+          `k=F=>{window.removeEventListener("pointerup",k);let O=F?.target,_live=Boolean(globalThis.__EXCALIDRAW_MD__?.enabled&&globalThis.__EXCALIDRAW_MD__?.liveEdit),j=O instanceof HTMLElement&&(O.classList.contains("properties-trigger")||Boolean(O.closest(".md-live-editor-root")));setTimeout(()=>{d.onblur=_live?null:I,(_live||j)||d.focus()})}`
+        );
+        out = out.replace(
+          mPattern,
+          `let j=O instanceof HTMLElement&&(O.classList.contains("properties-trigger")||Boolean(O.closest(".md-live-editor-root")));`
+        );
+        out = out.replace(
+          nPattern,
+          `N=l.scene.onUpdate(()=>{m(),(Boolean(globalThis.__EXCALIDRAW_MD__?.enabled&&globalThis.__EXCALIDRAW_MD__?.liveEdit)||!!document.activeElement?.closest(".properties-content,.md-live-editor-root"))||d.focus()})`
+        );
+        return out;
+      }
+    }
+
     const initPattern = /n\("Virgil",\.\.\.(\w+)\),n\(Mn,\.\.\.(\w+)\)/;
     if (!initPattern.test(code)) return null;
 

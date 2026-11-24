@@ -3,9 +3,14 @@ import rough from "roughjs";
 import { getElementFontFamilyStr } from "./cjkFonts";
 import { parseMarkdownLine } from "./nativeMarkdown";
 import {
-  applyInlineFormat,
-  applyInlineHighlight,
-} from "./textFormatting";
+  applyDomRichAction,
+  domToMarkdown,
+  getClosestLineEl,
+  markdownToHtml,
+  placeCaretIn,
+  setLineBlockType,
+  tryLiveMarkdownRule,
+} from "./richMarkdownDom";
 import {
   canMergeRange,
   canSplitRange,
@@ -285,6 +290,8 @@ export default function TableCard({
   const tableWrapRef = useRef(null);
   const tableElRef = useRef(null);
   const editorRef = useRef(null);
+  const cellComposingRef = useRef(false);
+  const cellSavedRangeRef = useRef(null);
   const dragOriginRef = useRef(null);
   const draggingRef = useRef(false);
   const resizeStateRef = useRef(null);
@@ -344,16 +351,38 @@ export default function TableCard({
     return () => ro.disconnect();
   }, []);
 
-  // Focus & auto-size textarea when entering cell edit mode
+  // Hydrate & focus live WYSIWYG cell editor when entering cell edit mode
   useEffect(() => {
     const el = editorRef.current;
-    if (!el || !editingCell) return;
-    el.focus();
-    const len = el.value.length;
-    el.setSelectionRange(len, len);
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
+    if (!el || !editingCell) {
+      globalThis.__EXCALIDRAW_LIVE_CELL_EDITOR__ = null;
+      return;
+    }
+    const curText = table.rows[editingCell.r]?.[editingCell.c]?.text ?? "";
+    el.innerHTML = markdownToHtml(curText, { allowTables: false });
+    el.focus({ preventScroll: true });
+    const lastLine = el.querySelector(":scope > .md-live-line:last-of-type");
+    const target =
+      lastLine?.getAttribute("data-block") === "task"
+        ? lastLine.querySelector(".md-live-task-body")
+        : lastLine || el;
+    placeCaretIn(target, false);
   }, [editingCell?.r, editingCell?.c]);
+
+  // Save selection range inside active live cell editor
+  useEffect(() => {
+    if (!editingCell) return;
+    const onSel = () => {
+      const el = editorRef.current;
+      if (!el) return;
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0 && el.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+        cellSavedRangeRef.current = sel.getRangeAt(0).cloneRange();
+      }
+    };
+    document.addEventListener("selectionchange", onSel);
+    return () => document.removeEventListener("selectionchange", onSel);
+  }, [editingCell]);
 
   const commit = useCallback(
     (nextTable) => {
@@ -467,50 +496,122 @@ export default function TableCard({
     return () => window.removeEventListener("pointerup", onWinUp);
   }, []);
 
-  // Keyboard navigation & inline Markdown shortcuts inside cell editor
+  // Bridge live cell editor actions so Left Style Panel buttons format the live selection directly
+  useEffect(() => {
+    if (!editingCell || !isActive || readOnly) {
+      globalThis.__EXCALIDRAW_LIVE_CELL_EDITOR__ = null;
+      return;
+    }
+    const bridge = {
+      applyAction: (action) => {
+        const el = editorRef.current;
+        if (!el) return false;
+
+        // Capture selection before focusing; if collapsed inside a non-empty cell, select all cell content
+        const selBefore = window.getSelection();
+        let targetRange = null;
+        if (
+          selBefore &&
+          selBefore.rangeCount > 0 &&
+          el.contains(selBefore.getRangeAt(0).commonAncestorContainer) &&
+          !selBefore.getRangeAt(0).collapsed
+        ) {
+          targetRange = selBefore.getRangeAt(0).cloneRange();
+        } else if (
+          cellSavedRangeRef.current &&
+          el.contains(cellSavedRangeRef.current.commonAncestorContainer) &&
+          !cellSavedRangeRef.current.collapsed
+        ) {
+          targetRange = cellSavedRangeRef.current.cloneRange();
+        } else if (
+          action.type !== "block" &&
+          el.textContent.replace(/\u200B/g, "").trim().length > 0
+        ) {
+          const singleLine = el.querySelector(":scope > .md-live-line");
+          const targetEl =
+            el.children.length === 1 && singleLine
+              ? singleLine.getAttribute("data-block") === "task"
+                ? singleLine.querySelector(".md-live-task-body") || singleLine
+                : singleLine
+              : el;
+          targetRange = document.createRange();
+          targetRange.selectNodeContents(targetEl);
+        }
+
+        el.focus({ preventScroll: true });
+        if (targetRange) {
+          const sel = window.getSelection();
+          sel?.removeAllRanges();
+          sel?.addRange(targetRange);
+        }
+
+        const changed = applyDomRichAction(el, action, {
+          savedRange: targetRange || cellSavedRangeRef.current,
+          isZh,
+        });
+        if (changed) {
+          updateCell(editingCell.r, editingCell.c, { text: domToMarkdown(el) });
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount > 0 && el.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+            cellSavedRangeRef.current = sel.getRangeAt(0).cloneRange();
+          }
+        }
+        return changed;
+      },
+    };
+    globalThis.__EXCALIDRAW_LIVE_CELL_EDITOR__ = bridge;
+    return () => {
+      if (globalThis.__EXCALIDRAW_LIVE_CELL_EDITOR__ === bridge) {
+        globalThis.__EXCALIDRAW_LIVE_CELL_EDITOR__ = null;
+      }
+    };
+  }, [editingCell, isActive, readOnly, isZh, updateCell]);
+
+  // Keyboard navigation & live WYSIWYG Markdown shortcuts inside cell editor
   const handleCellKeyDown = useCallback(
     (e, r, c) => {
       e.stopPropagation();
+      if (e.isComposing || cellComposingRef.current || e.keyCode === 229) return;
       const rowCount = table.rows.length;
       const colCount = table.colWidths.length;
       const cell = table.rows[r][c];
-      const ta = e.currentTarget;
+      const editor = e.currentTarget;
 
-      // Inline Markdown shortcuts inside cell textarea
+      // Live inline Markdown shortcuts inside cell editor
       if ((e.ctrlKey || e.metaKey) && !e.altKey) {
         const k = e.key.toLowerCase();
-        const applyMd = (res) => {
-          updateCell(r, c, { text: res.text });
-          requestAnimationFrame(() => {
-            if (editorRef.current) {
-              editorRef.current.focus();
-              editorRef.current.setSelectionRange(res.start, res.end);
-            }
+        const runAction = (action) => {
+          const changed = applyDomRichAction(editor, action, {
+            savedRange: cellSavedRangeRef.current,
+            isZh,
           });
+          if (changed) {
+            updateCell(r, c, { text: domToMarkdown(editor) });
+          }
         };
         if (!e.shiftKey && k === "b") {
           e.preventDefault();
-          applyMd(applyInlineFormat(ta.value, ta.selectionStart, ta.selectionEnd, "bold"));
+          runAction({ type: "inline", kind: "bold" });
           return;
         }
         if (!e.shiftKey && k === "i") {
           e.preventDefault();
-          applyMd(applyInlineFormat(ta.value, ta.selectionStart, ta.selectionEnd, "italic"));
+          runAction({ type: "inline", kind: "italic" });
           return;
         }
         if (!e.shiftKey && k === "e") {
           e.preventDefault();
-          applyMd(applyInlineFormat(ta.value, ta.selectionStart, ta.selectionEnd, "code"));
+          runAction({ type: "inline", kind: "code" });
           return;
         }
         if (e.shiftKey && k === "x") {
           e.preventDefault();
-          applyMd(applyInlineFormat(ta.value, ta.selectionStart, ta.selectionEnd, "strike"));
+          runAction({ type: "inline", kind: "strike" });
           return;
         }
         if (e.shiftKey && k === "h") {
           e.preventDefault();
-          applyMd(applyInlineHighlight(ta.value, ta.selectionStart, ta.selectionEnd, "yellow"));
+          runAction({ type: "highlight", color: "yellow" });
           return;
         }
       }
@@ -540,7 +641,6 @@ export default function TableCard({
       }
 
       if (e.key === "Enter" && !e.shiftKey && !e.altKey) {
-        if (e.isComposing || e.keyCode === 229) return;
         e.preventDefault();
         const nextR = r + (cell.rowSpan || 1);
         if (nextR < rowCount) {
@@ -551,9 +651,54 @@ export default function TableCard({
         return;
       }
 
-      if (e.key === "ArrowUp" && !e.shiftKey) {
-        const beforeCaret = ta.value.slice(0, ta.selectionStart);
-        if (!beforeCaret.includes("\n") && r > 0) {
+      if (e.key === "Enter" && e.shiftKey) {
+        e.preventDefault();
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount) {
+          const lineEl = getClosestLineEl(sel.getRangeAt(0).startContainer, editor);
+          const nextDiv = document.createElement("div");
+          nextDiv.className = "md-live-line";
+          nextDiv.setAttribute("data-block", "normal");
+          nextDiv.innerHTML = "<br>";
+          if (lineEl && lineEl.parentElement === editor) {
+            lineEl.insertAdjacentElement("afterend", nextDiv);
+          } else {
+            editor.appendChild(nextDiv);
+          }
+          placeCaretIn(nextDiv, true);
+          updateCell(r, c, { text: domToMarkdown(editor) });
+        }
+        return;
+      }
+
+      if (e.key === "Backspace") {
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount && sel.isCollapsed) {
+          const rng = sel.getRangeAt(0);
+          const lineEl = getClosestLineEl(rng.startContainer, editor);
+          const blk = lineEl?.getAttribute("data-block") || "normal";
+          if (lineEl && blk !== "normal") {
+            const host =
+              blk === "task"
+                ? lineEl.querySelector(".md-live-task-body") || lineEl
+                : lineEl;
+            const pre = document.createRange();
+            pre.setStart(host, 0);
+            pre.setEnd(rng.startContainer, rng.startOffset);
+            if (pre.toString().replace(/\u200B/g, "").length === 0) {
+              e.preventDefault();
+              setLineBlockType(lineEl, "normal");
+              placeCaretIn(lineEl, true);
+              updateCell(r, c, { text: domToMarkdown(editor) });
+              return;
+            }
+          }
+        }
+      }
+
+      if (e.key === "ArrowUp" && !e.shiftKey && r > 0) {
+        const lines = editor.querySelectorAll(":scope > .md-live-line");
+        if (lines.length <= 1) {
           e.preventDefault();
           moveFocusTo(r - 1, c, true);
         }
@@ -561,15 +706,15 @@ export default function TableCard({
       }
 
       if (e.key === "ArrowDown" && !e.shiftKey) {
-        const afterCaret = ta.value.slice(ta.selectionEnd);
+        const lines = editor.querySelectorAll(":scope > .md-live-line");
         const nextR = r + (cell.rowSpan || 1);
-        if (!afterCaret.includes("\n") && nextR < rowCount) {
+        if (lines.length <= 1 && nextR < rowCount) {
           e.preventDefault();
           moveFocusTo(nextR, c, true);
         }
       }
     },
-    [table, updateCell, moveFocusTo, handleAppendRow]
+    [table, isZh, updateCell, moveFocusTo, handleAppendRow]
   );
 
   // Card-level shortcuts when a range is selected (not actively typing in textarea)
@@ -625,13 +770,30 @@ export default function TableCard({
     [isActive, readOnly, editingCell, expandedRange, table, commit]
   );
 
-  // Smart paste from Excel / Feishu / Google Sheets (TSV) or Markdown pipe table
+  // Smart paste from Excel / Feishu / Google Sheets (TSV) or Markdown pipe table, or plain text
   const handleCellPaste = useCallback(
     (e, startR, startC) => {
       e.stopPropagation();
-      const text = e.clipboardData?.getData("text/plain");
+      const text = e.clipboardData?.getData("text/plain") || "";
       const parsed = parseTabularPaste(text);
-      if (!parsed) return;
+      if (!parsed) {
+        e.preventDefault();
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount) {
+          const rng = sel.getRangeAt(0);
+          rng.deleteContents();
+          const node = document.createTextNode(text.replace(/\r\n?/g, "\n"));
+          rng.insertNode(node);
+          rng.setStartAfter(node);
+          rng.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(rng);
+          if (editorRef.current) {
+            updateCell(startR, startC, { text: domToMarkdown(editorRef.current) });
+          }
+        }
+        return;
+      }
 
       e.preventDefault();
       const pastedRows = parsed.rows;
@@ -666,7 +828,7 @@ export default function TableCard({
 
       commit({ ...next, colAligns: nextAligns, rows: nextRows });
     },
-    [table, commit]
+    [table, commit, updateCell]
   );
 
   const stop = (e) => e.stopPropagation();
@@ -869,20 +1031,51 @@ export default function TableCard({
                           }}
                         >
                           {isEditing ? (
-                            <textarea
+                            <div
                               ref={editorRef}
-                              className="tbl-cell-editor"
-                              rows={1}
-                              value={cell.text}
+                              className="tbl-cell-live-editor"
+                              contentEditable
+                              suppressContentEditableWarning
+                              spellCheck={false}
                               style={{
                                 textAlign: align,
                                 fontWeight: isHeader || cell.bold ? 600 : 400,
                               }}
                               onPointerDown={stop}
-                              onChange={(e) => {
-                                e.target.style.height = "auto";
-                                e.target.style.height = `${e.target.scrollHeight}px`;
-                                updateCell(ri, ci, { text: e.target.value });
+                              onMouseDown={(e) => {
+                                e.stopPropagation();
+                                const chk = e.target instanceof Element ? e.target.closest('[data-md-check="1"]') : null;
+                                if (chk) {
+                                  e.preventDefault();
+                                  const line = chk.closest(".md-live-line");
+                                  if (line) {
+                                    const next = line.getAttribute("data-checked") === "1" ? "0" : "1";
+                                    line.setAttribute("data-checked", next);
+                                    chk.setAttribute("aria-checked", next === "1" ? "true" : "false");
+                                    if (editorRef.current) {
+                                      updateCell(ri, ci, { text: domToMarkdown(editorRef.current) });
+                                    }
+                                  }
+                                }
+                              }}
+                              onInput={(e) => {
+                                if (cellComposingRef.current) return;
+                                const el = e.currentTarget;
+                                if (el.childNodes.length === 0) {
+                                  el.innerHTML = `<div class="md-live-line" data-block="normal"><br></div>`;
+                                  placeCaretIn(el.firstElementChild, true);
+                                }
+                                tryLiveMarkdownRule(el);
+                                updateCell(ri, ci, { text: domToMarkdown(el) });
+                              }}
+                              onCompositionStart={() => {
+                                cellComposingRef.current = true;
+                              }}
+                              onCompositionEnd={(e) => {
+                                cellComposingRef.current = false;
+                                const el = e.currentTarget;
+                                tryLiveMarkdownRule(el);
+                                updateCell(ri, ci, { text: domToMarkdown(el) });
                               }}
                               onKeyDown={(e) => handleCellKeyDown(e, ri, ci)}
                               onPaste={(e) => handleCellPaste(e, ri, ci)}

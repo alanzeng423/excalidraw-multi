@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import LiveMarkdownEditor from "./LiveMarkdownEditor";
 import {
   CJK_FONTS,
   ensureCjkFontLoaded,
@@ -308,18 +309,31 @@ export default function TextStylePanel({
 
     const ta = document.querySelector("textarea.excalidraw-wysiwyg");
     if (ta) {
-      const start = ta.selectionStart ?? 0;
-      const end = ta.selectionEnd ?? start;
-      lastSelRef.current = { start, end };
+      const liveEd = globalThis.__EXCALIDRAW_LIVE_EDITOR__;
       setIsEditingText(true);
-      setActive(detectActiveFormats(ta.value, start, end));
-      setMdTableState({
-        hasTable: hasMarkdownTable(ta.value),
-        outerBorder:
-          textEls.length > 0
-            ? textEls[0].customData?.tableOuterBorder !== false
-            : true,
-      });
+      if (liveEd) {
+        const md = liveEd.getMarkdown();
+        setActive(liveEd.getActiveFormats());
+        setMdTableState({
+          hasTable: hasMarkdownTable(md),
+          outerBorder:
+            textEls.length > 0
+              ? textEls[0].customData?.tableOuterBorder !== false
+              : true,
+        });
+      } else {
+        const start = ta.selectionStart ?? 0;
+        const end = ta.selectionEnd ?? start;
+        lastSelRef.current = { start, end };
+        setActive(detectActiveFormats(ta.value, start, end));
+        setMdTableState({
+          hasTable: hasMarkdownTable(ta.value),
+          outerBorder:
+            textEls.length > 0
+              ? textEls[0].customData?.tableOuterBorder !== false
+              : true,
+        });
+      }
       setMdTableOverlay(null);
       return;
     }
@@ -656,6 +670,13 @@ export default function TextStylePanel({
         onEnsureNativeMd?.();
       }
 
+      const liveEd = globalThis.__EXCALIDRAW_LIVE_EDITOR__;
+      if (liveEd && nativeMd) {
+        liveEd.applyAction(action);
+        requestAnimationFrame(refreshActiveState);
+        return;
+      }
+
       const ta = document.querySelector("textarea.excalidraw-wysiwyg");
       if (ta) {
         const start =
@@ -829,6 +850,7 @@ export default function TextStylePanel({
     });
     api.updateScene({ elements: nextElements });
     api.refresh?.();
+    globalThis.__EXCALIDRAW_LIVE_EDITOR__?.setTableOuterBorder?.(nextOuter);
     setMdTableState((prev) => ({ ...prev, outerBorder: nextOuter }));
     requestAnimationFrame(refreshActiveState);
   }, [api, readOnly, refreshActiveState]);
@@ -889,7 +911,14 @@ export default function TextStylePanel({
     (action) => {
       if (!activeTable || !currentRange) return;
 
-      // If user is actively editing a table cell textarea, apply to its selection range!
+      // If user is actively editing a live WYSIWYG table cell, apply directly to its DOM selection!
+      const liveCell = globalThis.__EXCALIDRAW_LIVE_CELL_EDITOR__;
+      if (liveCell && tableSel?.editingCell) {
+        liveCell.applyAction(action);
+        return;
+      }
+
+      // Fallback for raw textarea if present
       const cellTa = document.querySelector("textarea.tbl-cell-editor");
       if (cellTa && tableSel?.editingCell) {
         const s = cellTa.selectionStart ?? 0;
@@ -990,6 +1019,21 @@ export default function TextStylePanel({
 
   return (
     <>
+      {/* 0. Real-time WYSIWYG Markdown & Table Editor overlaying Excalidraw's wysiwyg textarea */}
+      <LiveMarkdownEditor
+        api={api}
+        nativeMd={nativeMd}
+        readOnly={readOnly}
+        langCode={langCode}
+        onFormatsChange={(fmts, md) => {
+          setActive(fmts);
+          setMdTableState((prev) => ({
+            ...prev,
+            hasTable: hasMarkdownTable(md),
+          }));
+        }}
+      />
+
       {/* 1. Compact Chinese font toggle button fused right inside Excalidraw's native Font row */}
       {cjkBtnHostEl &&
         createPortal(

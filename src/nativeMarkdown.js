@@ -1484,6 +1484,7 @@ export function initNativeMarkdown() {
   if (globalThis.__EXCALIDRAW_MD__) return globalThis.__EXCALIDRAW_MD__;
   const bridge = {
     enabled: readInitialEnabled(),
+    liveEdit: true,
     measureLineWidth,
     measureBlockHeight,
     drawCanvasText,
